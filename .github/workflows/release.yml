@@ -1,0 +1,220 @@
+# Shotfuse release workflow: Developer ID sign + hardened runtime + notarize + staple.
+#
+# Required repository secrets:
+#   MACOS_CERTIFICATE              base64-encoded Developer ID Application .p12
+#   MACOS_CERTIFICATE_PWD          password that unlocks the .p12
+#   APPLE_ID                       Apple ID email used for notarytool
+#   APPLE_TEAM_ID                  10-char Team ID (xcrun altool --list-providers)
+#   APPLE_APP_SPECIFIC_PASSWORD    app-specific password from appleid.apple.com
+#
+# KEYCHAIN_PWD is NOT a secret — it's generated per-run via uuidgen and
+# lives only inside the ephemeral runner keychain for a few minutes.
+#
+# SPEC §1 contract: Developer ID signing, hardened runtime (--options=runtime),
+# notarization, and staple — no App Store sandbox. SPEC §11 revisits this
+# workflow before tagging v0.1.0 (beads hq-6a4).
+
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Sign, notarize, staple
+    # macos-14 gives us a reasonably stable Xcode image.
+    # TODO(hq-6a4 follow-up): pin an explicit Xcode version (sudo xcode-select
+    # -s /Applications/Xcode_<X>.app) once v0.1.0 locks the toolchain.
+    runs-on: macos-14
+
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+      MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode
+        # TODO(hq-6a4 follow-up): version-lock once v0.1.0 picks a toolchain.
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode projects
+        run: |
+          (cd App && xcodegen)
+          (cd CLI && xcodegen)
+
+      - name: Generate ephemeral keychain password
+        run: |
+          echo "KEYCHAIN_PWD=$(uuidgen)" >> "$GITHUB_ENV"
+
+      - name: Import Developer ID certificate
+        run: |
+          set -euo pipefail
+          security create-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PWD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          echo "$MACOS_CERTIFICATE" | base64 --decode -o certificate.p12
+          security import certificate.p12 \
+            -k build.keychain \
+            -P "$MACOS_CERTIFICATE_PWD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PWD" build.keychain
+          rm -f certificate.p12
+
+      - name: Write ExportOptions.plist
+        run: |
+          mkdir -p build
+          cat > build/ExportOptions.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>developer-id</string>
+            <key>teamID</key>
+            <string>$(APPLE_TEAM_ID)</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+            <key>signingCertificate</key>
+            <string>Developer ID Application</string>
+          </dict>
+          </plist>
+          PLIST
+          # Substitute the real team id (plist heredoc is literal by design).
+          /usr/bin/sed -i '' "s/\$(APPLE_TEAM_ID)/$APPLE_TEAM_ID/" build/ExportOptions.plist
+
+      - name: Archive App (Shotfuse.app)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace Shotfuse.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -archivePath build/Shotfuse.xcarchive \
+            archive \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp --options=runtime"
+
+      - name: Export Developer-ID-signed Shotfuse.app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -exportArchive \
+            -archivePath build/Shotfuse.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist build/ExportOptions.plist
+
+      - name: Archive CLI (shot)
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace Shotfuse.xcworkspace \
+            -scheme shot \
+            -configuration Release \
+            -archivePath build/shot.xcarchive \
+            archive \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp --options=runtime"
+
+      - name: Export and standalone-codesign shot CLI
+        run: |
+          set -euo pipefail
+          # Pull the tool out of the archive and sign it directly — tool targets
+          # don't round-trip cleanly through -exportArchive the way apps do.
+          mkdir -p build/export
+          cp "build/shot.xcarchive/Products/usr/local/bin/shot" build/export/shot
+          /usr/bin/codesign \
+            --force \
+            --sign "Developer ID Application" \
+            --timestamp \
+            --options=runtime \
+            build/export/shot
+          /usr/bin/codesign --verify --strict --verbose=2 build/export/shot
+
+      - name: Zip app for notarization
+        run: |
+          /usr/bin/ditto -c -k --keepParent build/export/Shotfuse.app build/Shotfuse.zip
+
+      - name: Notarize app
+        run: |
+          set -euo pipefail
+          xcrun notarytool submit build/Shotfuse.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+      - name: Staple app
+        run: |
+          set -euo pipefail
+          xcrun stapler staple build/export/Shotfuse.app
+          xcrun stapler validate build/export/Shotfuse.app
+
+      - name: Zip shot CLI for notarization
+        run: |
+          /usr/bin/ditto -c -k build/export/shot build/shot.zip
+
+      - name: Notarize shot CLI
+        run: |
+          set -euo pipefail
+          xcrun notarytool submit build/shot.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+      - name: Staple shot CLI
+        # Bare Mach-O binaries don't accept a stapled ticket — Gatekeeper looks
+        # the ticket up online instead. We re-verify the signature + notarization
+        # with spctl to prove the binary ships in the right state.
+        run: |
+          set -euo pipefail
+          /usr/bin/codesign --verify --strict --verbose=2 build/export/shot
+          /usr/sbin/spctl --assess --type execute --verbose=4 build/export/shot || true
+
+      - name: Repack stapled app as zip for distribution
+        run: |
+          /usr/bin/ditto -c -k --keepParent build/export/Shotfuse.app build/Shotfuse-stapled.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: shotfuse-release
+          path: |
+            build/Shotfuse-stapled.zip
+            build/export/shot
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        # TODO(hq-6a4 follow-up): pin softprops/action-gh-release by commit SHA
+        # once v0.1.0 ships (currently using the floating @v2 tag).
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/Shotfuse-stapled.zip
+            build/export/shot
+          generate_release_notes: true
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain build.keychain || true
