@@ -9,19 +9,19 @@ struct MenuBarView: View {
     let appDelegate: AppDelegate
 
     var body: some View {
-        Button("Capture region  ⇧⌘4") {
+        Button("Capture region  ⌥⌘4") {
             Task { [appDelegate] in
                 guard let coordinator = appDelegate.coordinator else { return }
                 _ = try? await coordinator.captureRegion()
             }
         }
-        Button("Capture fullscreen  ⇧⌘3") {
+        Button("Capture fullscreen  ⌥⌘3") {
             Task { [appDelegate] in
                 guard let coordinator = appDelegate.coordinator else { return }
                 _ = try? await coordinator.captureFullscreen(display: CGMainDisplayID())
             }
         }
-        Button("Capture witness  ⇧⌘W") {
+        Button("Capture witness  ⌥⌘W") {
             Task { [appDelegate] in
                 guard let coordinator = appDelegate.coordinator else { return }
                 _ = try? await coordinator.captureWitness()

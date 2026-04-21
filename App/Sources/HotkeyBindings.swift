@@ -14,14 +14,16 @@ public enum HotkeyBindings {
     public static let searchHotkeyID: UInt32 = 3
     public static let witnessHotkeyID: UInt32 = 4
 
-    /// `kVK_ANSI_4` — the "4" key. Cmd+Shift+4 for region capture mirrors
-    /// macOS's built-in shortcut so users keep their muscle memory.
+    /// `kVK_ANSI_4` — the "4" key. Cmd+Option+4 for region capture
+    /// (Cmd+Shift+4 collides with macOS native + CleanShot).
     public static let keyCode4: UInt32 = 21
-    /// `kVK_ANSI_3` — Cmd+Shift+3 for fullscreen, matching macOS.
+    /// `kVK_ANSI_3` — Cmd+Option+3 for fullscreen
+    /// (Cmd+Shift+3 collides with macOS native + CleanShot).
     public static let keyCode3: UInt32 = 20
     /// `kVK_ANSI_G` — Cmd+Shift+G for search overlay.
     public static let keyCodeG: UInt32 = 5
-    /// `kVK_ANSI_W` — Cmd+Shift+W for witness capture.
+    /// `kVK_ANSI_W` — Cmd+Option+W for witness capture
+    /// (Cmd+Shift+W closes a window in most apps).
     public static let keyCodeW: UInt32 = 13
 
     /// Single binding row describing one hotkey we want registered at
@@ -34,17 +36,21 @@ public enum HotkeyBindings {
         public let label: String
     }
 
-    /// Cmd+Shift modifier mask — every v0.1 hotkey shares this.
+    /// Cmd+Shift modifier mask. Kept because `SearchOverlayController` still
+    /// uses Cmd+Shift+G (no conflict observed).
     public static let cmdShift: UInt32 = HotkeyModifiers.command | HotkeyModifiers.shift
+    /// Cmd+Option modifier mask — capture hotkeys use this to avoid the
+    /// Cmd+Shift+[3/4/5] collision with macOS native + CleanShot.
+    public static let cmdOption: UInt32 = HotkeyModifiers.command | HotkeyModifiers.option
 
     /// The four W1 hotkeys in registration order. `searchHotkeyID` is
     /// registered by `SearchOverlayController` itself (see `activate()`);
     /// including it here keeps the diagnostics story honest — the App
     /// knows which ids are in play even if it doesn't own all of them.
     public static let all: [Binding] = [
-        Binding(id: regionHotkeyID,     keyCode: keyCode4, modifiers: cmdShift, label: "Capture region"),
-        Binding(id: fullscreenHotkeyID, keyCode: keyCode3, modifiers: cmdShift, label: "Capture fullscreen"),
-        Binding(id: witnessHotkeyID,    keyCode: keyCodeW, modifiers: cmdShift, label: "Capture witness"),
+        Binding(id: regionHotkeyID,     keyCode: keyCode4, modifiers: cmdOption, label: "Capture region"),
+        Binding(id: fullscreenHotkeyID, keyCode: keyCode3, modifiers: cmdOption, label: "Capture fullscreen"),
+        Binding(id: witnessHotkeyID,    keyCode: keyCodeW, modifiers: cmdOption, label: "Capture witness"),
     ]
 }
 
