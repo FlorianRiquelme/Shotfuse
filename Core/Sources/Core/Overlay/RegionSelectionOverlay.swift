@@ -66,6 +66,7 @@ final class OverlayView: NSView {
         dragStart = p
         dragCurrent = p
         needsDisplay = true
+        NSLog("[shotfuse-overlay] mouseDown at (\(p.x), \(p.y))")
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -74,6 +75,7 @@ final class OverlayView: NSView {
         dragCurrent = p
         needsDisplay = true
         onDrag?(a, p)
+        NSLog("[shotfuse-overlay] mouseDragged to (\(p.x), \(p.y))")
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -83,6 +85,7 @@ final class OverlayView: NSView {
         dragCurrent = nil
         needsDisplay = true
         onRelease?(a, p)
+        NSLog("[shotfuse-overlay] mouseUp at (\(p.x), \(p.y)) — start=(\(a.x),\(a.y))")
     }
 
     override func keyDown(with event: NSEvent) {
@@ -207,10 +210,12 @@ public final class RegionSelectionOverlay {
 
         return try await withCheckedThrowingContinuation { cont in
             self.continuation = cont
+            NSApplication.shared.activate(ignoringOtherApps: true)
             for (w, _) in windows {
                 w.orderFrontRegardless()
             }
             windows.first?.0.makeKey()
+            NSLog("[shotfuse-overlay] presented \(windows.count) overlay window(s)")
         }
     }
 
