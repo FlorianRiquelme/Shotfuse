@@ -194,6 +194,8 @@ public actor ScreenCapturer {
     private let clock: any Clock<Duration>
     private let selfBundleIdentifier: String
     private let screenshot: any ScreenshotCapturing
+    private let windowScreenshot: any WindowScreenshotCapturing
+    private let fullscreenScreenshot: any FullscreenScreenshotCapturing
 
     // MARK: Init
 
@@ -209,8 +211,11 @@ public actor ScreenCapturer {
     ///     `ContinuousClock()`; tests can supply a fake clock.
     ///   - selfBundleIdentifier: bundle ID to exclude from the content
     ///     filter. Defaults to `ShotfuseBundle.identifier`.
-    ///   - screenshot: the frame-grab backend. Defaults to the real
-    ///     `SCScreenshotManager` path. Tests inject a fake.
+    ///   - screenshot: the frame-grab backend for region capture.
+    ///   - windowScreenshot: the frame-grab backend for window capture
+    ///     (SPEC §14; hq-dvr). Defaults to the real SCK path.
+    ///   - fullscreenScreenshot: the frame-grab backend for fullscreen
+    ///     capture (hq-dvr). Defaults to the real SCK path.
     public init(
         contentProvider: any ShareableContentProviding = DefaultShareableContentProvider(),
         deepLinkOpener: @escaping @Sendable (URL) -> Void = { url in
@@ -218,13 +223,17 @@ public actor ScreenCapturer {
         },
         clock: any Clock<Duration> = ContinuousClock(),
         selfBundleIdentifier: String = ShotfuseBundle.identifier,
-        screenshot: any ScreenshotCapturing = DefaultScreenshotCapturer()
+        screenshot: any ScreenshotCapturing = DefaultScreenshotCapturer(),
+        windowScreenshot: any WindowScreenshotCapturing = DefaultWindowScreenshotCapturer(),
+        fullscreenScreenshot: any FullscreenScreenshotCapturing = DefaultFullscreenScreenshotCapturer()
     ) {
         self.contentProvider = contentProvider
         self.deepLinkOpener = deepLinkOpener
         self.clock = clock
         self.selfBundleIdentifier = selfBundleIdentifier
         self.screenshot = screenshot
+        self.windowScreenshot = windowScreenshot
+        self.fullscreenScreenshot = fullscreenScreenshot
     }
 
     // MARK: - Public API
@@ -254,6 +263,147 @@ public actor ScreenCapturer {
     public func plan(for selection: RegionSelection) async throws -> (CaptureFilterPlan, CaptureConfigurationPlan) {
         let content = try await preflight()
         return try makePlans(content: content, selection: selection)
+    }
+
+    // MARK: - Window capture (SPEC §14; hq-dvr / P5.2)
+
+    /// Capture a single window by owning PID + `CGWindowID`.
+    ///
+    /// - Parameters:
+    ///   - pid: owning-application PID of the target window.
+    ///   - windowID: `CGWindowID` (WindowServer id) of the target window.
+    ///   - includeChildren: SPEC §14 — `true` composites sheets/popovers
+    ///     into the frame. v0.1 always passes `true` from the hotkey path.
+    /// - Throws: `ScreenCaptureError.permissionDenied` /
+    ///   `.preflightTimeout` / `.captureFailed`.
+    public func captureWindow(
+        pid: pid_t,
+        windowID: CGWindowID,
+        includeChildren: Bool
+    ) async throws -> CapturedFrame {
+        let content = try await preflight()
+        guard let windowContent = content as? any WindowShareableContentSnapshot else {
+            throw ScreenCaptureError.captureFailed(
+                "Window capture requires a window-aware ShareableContentProviding"
+            )
+        }
+        let (filterPlan, configPlan) = try makeWindowCapturePlans(
+            content: windowContent,
+            pid: pid,
+            windowID: windowID,
+            includeChildren: includeChildren,
+            selfBundleIdentifier: selfBundleIdentifier
+        )
+        let image = try await windowScreenshot.captureWindowImage(
+            content: windowContent,
+            filterPlan: filterPlan,
+            configurationPlan: configPlan
+        )
+        // Window capture has no natural `DisplayMetadata`; callers who need
+        // it can hit-test the window's frame themselves. We use a synthetic
+        // `DisplayMetadata` with the window's host display at 0 — downstream
+        // packaging (CaptureFinalization) only reads pixelBounds/image here.
+        let pixelBounds = CGRect(
+            x: 0,
+            y: 0,
+            width: image.width,
+            height: image.height
+        )
+        return CapturedFrame(
+            image: image,
+            pixelBounds: pixelBounds,
+            display: DisplayMetadata(
+                id: 0,
+                nativeWidth: image.width,
+                nativeHeight: image.height,
+                nativeScale: 1.0,
+                vendorID: nil,
+                productID: nil,
+                serial: nil,
+                localizedName: "",
+                globalFrame: .zero
+            ),
+            capturedAt: Date()
+        )
+    }
+
+    /// Plan-only variant of `captureWindow` for test introspection.
+    public func planWindow(
+        pid: pid_t,
+        windowID: CGWindowID,
+        includeChildren: Bool
+    ) async throws -> (WindowCaptureFilterPlan, CaptureConfigurationPlan) {
+        let content = try await preflight()
+        guard let windowContent = content as? any WindowShareableContentSnapshot else {
+            throw ScreenCaptureError.captureFailed(
+                "Window capture requires a window-aware ShareableContentProviding"
+            )
+        }
+        return try makeWindowCapturePlans(
+            content: windowContent,
+            pid: pid,
+            windowID: windowID,
+            includeChildren: includeChildren,
+            selfBundleIdentifier: selfBundleIdentifier
+        )
+    }
+
+    // MARK: - Fullscreen capture (hq-dvr / P5.2)
+
+    /// Capture the full frame of a single `SCDisplay`.
+    ///
+    /// - Parameter display: `CGDirectDisplayID` of the target display.
+    ///   The resulting frame captures ONLY this display; no other display's
+    ///   pixels leak into the output.
+    public func captureFullscreen(
+        display: CGDirectDisplayID
+    ) async throws -> CapturedFrame {
+        let content = try await preflight()
+        let (filterPlan, configPlan, displaySnap) = try makeFullscreenCapturePlans(
+            content: content,
+            displayID: display,
+            selfBundleIdentifier: selfBundleIdentifier
+        )
+        let image = try await fullscreenScreenshot.captureFullscreenImage(
+            content: content,
+            filterPlan: filterPlan,
+            configurationPlan: configPlan
+        )
+        let pixelBounds = CGRect(
+            x: 0,
+            y: 0,
+            width: configPlan.width,
+            height: configPlan.height
+        )
+        return CapturedFrame(
+            image: image,
+            pixelBounds: pixelBounds,
+            display: DisplayMetadata(
+                id: displaySnap.displayID,
+                nativeWidth: displaySnap.width,
+                nativeHeight: displaySnap.height,
+                nativeScale: 1.0,
+                vendorID: nil,
+                productID: nil,
+                serial: nil,
+                localizedName: "",
+                globalFrame: displaySnap.frame
+            ),
+            capturedAt: Date()
+        )
+    }
+
+    /// Plan-only variant of `captureFullscreen` for test introspection.
+    public func planFullscreen(
+        display: CGDirectDisplayID
+    ) async throws -> (FullscreenCaptureFilterPlan, CaptureConfigurationPlan) {
+        let content = try await preflight()
+        let (filterPlan, configPlan, _) = try makeFullscreenCapturePlans(
+            content: content,
+            displayID: display,
+            selfBundleIdentifier: selfBundleIdentifier
+        )
+        return (filterPlan, configPlan)
     }
 
     // MARK: - Preflight
