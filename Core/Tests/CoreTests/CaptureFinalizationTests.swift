@@ -13,10 +13,11 @@ private struct Fixtures {
             nativeWidth: 3024,
             nativeHeight: 1964,
             nativeScale: 2.0,
-            vendorID: "0x05AC",
-            productID: "0xA050",
+            vendorID: 0x05AC,
+            productID: 0xA050,
             serial: nil,
-            localizedName: "Built-in Retina Display"
+            localizedName: "Built-in Retina Display",
+            globalFrame: CGRect(x: 0, y: 0, width: 1512, height: 982)
         )
     }
 

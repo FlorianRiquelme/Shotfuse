@@ -85,7 +85,11 @@ private let fixtureDisplayMeta = DisplayMetadata(
     nativeWidth: 2880,
     nativeHeight: 1800,
     nativeScale: 2.0,
-    localizedName: "Fixture Display"
+    vendorID: nil,
+    productID: nil,
+    serial: nil,
+    localizedName: "Fixture Display",
+    globalFrame: CGRect(x: 0, y: 0, width: 1440, height: 900)
 )
 private let fixtureSelection = RegionSelection(
     rect: CGRect(x: 100, y: 200, width: 300, height: 400),
