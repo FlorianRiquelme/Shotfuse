@@ -1,9 +1,9 @@
 # Shotfuse — v0.1 Spec
 
 **Status**: canonical v0.1 contract
-**Spec version**: 0.1.1
+**Spec version**: 0.1.2
 **Dated**: 2026-04-21
-**Source**: tightened from `BRAINSTORM.md` after multi-AI brainstorm + naming round; audited 2026-04-21 (see `SPEC-AUDIT-2026-04-21.md`) and updated 0.1.0 → 0.1.1. BRAINSTORM.md remains the narrative record; SPEC.md is the executable contract.
+**Source**: tightened from `BRAINSTORM.md` after multi-AI brainstorm + naming round; audited 2026-04-21 (see `SPEC-AUDIT-2026-04-21.md`) and updated 0.1.0 → 0.1.1. Blocker spikes A + B resolved 2026-04-21 (see `bd show hq-91t` / `bd show hq-alo`); results folded in as 0.1.2 — no architecture contract or vocabulary change, so no spec-delta branch per §12. BRAINSTORM.md remains the narrative record; SPEC.md is the executable contract.
 
 ---
 
@@ -104,7 +104,7 @@ Breaking one of these requires a versioned spec delta (§12), not a code-only ch
 6. **Crop rects and window frames are stored in canonical point space + full display metadata.** DPI conversion happens at the last moment (export/render), never at storage.
 7. **Global hotkeys use `RegisterEventHotKey` (Carbon).** No global event taps — avoids the Input Monitoring TCC gate. On registration failure (e.g., hotkey already owned by another app), Shotfuse writes a structured log entry to `unified-logging`, surfaces a warning badge on the menubar icon, and offers a settings deep-link to pick an alternate binding.
 8. **Screen Recording preflight uses the modern SCK API.** On launch, Shotfuse attempts `SCShareableContent.current` with a 1s timeout. Failure ⇒ deep-link to System Settings → Privacy & Security → Screen Recording. No capture surface is shown until the call succeeds.
-9. **Library index is SQLite + FTS5** at `~/.shotfuse/index.db`. Spotlight is not a dependency; if Spike B confirms it works, it becomes a nice-to-have on top, not a replacement.
+9. **Library index is SQLite + FTS5** at `~/.shotfuse/index.db`. Spotlight is not a dependency. Spike B (2026-04-21, `hq-alo`) confirmed package opacity is incompatible with Spotlight content indexing — `mdimport` finds no importer for the `.shot` UTI and does not descend into inner files. Spotlight-surface discovery ships later via Core Spotlight (`CSSearchableItem`, populated from the library scanner), deferred per §11.
 10. **Image captures never include the cursor.** SCK is configured with `showsCursor = false` for image mode. Video captures (post-v0.1) may opt in.
 11. **Shotfuse plays no audio during any active `SCStream` session.** The success chime (if any) is suppressed while a capture is in flight.
 12. **`.shot` package writes are atomic.** Packages are written to `<name>.shot.tmp/` and renamed to `<name>.shot/` only after `manifest.json` is `fsync`'d. Library scanners ignore `*.shot.tmp/`.
@@ -117,7 +117,7 @@ Breaking one of these requires a versioned spec delta (§12), not a code-only ch
 2026-04-21T10-43-12_com.apple.dt.Xcode.shot/
 ├── manifest.json           # canonical metadata; the index target
 ├── master.png              # immutable source pixels at native resolution
-├── thumb.jpg               # 256px preview for pinboard + QuickLook
+├── thumb.jpg               # 256px preview for pinboard (QuickLook plugin deferred; §11)
 ├── ocr.json                # Vision results (wrapped; see §6.3)
 ├── context.json            # AX tree snapshot + frontmost + clipboard + time
 ├── annotations.json        # vector annotation model (arrows, text, blur rects)
@@ -238,25 +238,33 @@ TCC status is re-checked per-capture (cheap), not only on launch. If permission 
 
 ---
 
-## 9. Blocker spikes — MUST complete before Weekend 1 code
+## 9. Blocker spikes — RESOLVED 2026-04-21
 
-Both spikes are architectural load-bearing. If either returns negative, this spec needs revision before implementation starts.
+Both spikes were architectural load-bearing. Both are complete. Implementation artifacts live under `spikes/`; verdicts recorded in the corresponding `bd` issues.
 
-### Spike A — AX tree extraction latency
+### Spike A — AX tree extraction latency · ✅ PASS · `hq-91t`
 
-**Question.** Can the AX tree snapshot for the frontmost app complete in ≤50ms p95 at capture time? If not, `context.json` enrichment must go async (post-capture) and the `Limbo` HUD must render without context on first paint.
+**Question.** Can the AX tree snapshot for the frontmost app complete in ≤50ms p95 at capture time?
 
-**DoD.** A ~30-line Swift benchmark that extracts `{ bundle_id, window_title, focused file_url / browser_url }` 20 times each against Xcode, VS Code, Safari, Slack, Obsidian. Report p50 / p95 / p99. Decision: sync if ≤50ms p95, else async with post-capture enrichment.
+**Result.** Yes, by a wide margin. Median of three runs: aggregate p95 = **0.47ms** across Xcode / Safari / Slack / Obsidian × 20 iters (VS Code not installed on test rig; noted). Steady-state p50 = 0.08–0.32ms per app. Run 1's single 1.5s outlier was cold-activation of Xcode — not a capture-time path, since the target app is already frontmost when the hotkey fires. Focused-URL extraction verified via `kAXDocumentAttribute` (Xcode) and `kAXURLAttribute` (Safari); Slack and Obsidian return nil, matching §6.2's optional-URL contract.
 
-**Feeds back into.** `CaptureEngine` state — whether `capturing → finalizing` blocks on AX or schedules it.
+**Decision.** Sync AX enrichment at capture time. `CaptureEngine` `capturing → finalizing` transition blocks on the AX snapshot. `Limbo` HUD paints with context on first frame. **Invariant 1 stands as written** — no async clause added.
 
-### Spike B — Spotlight + QuickLook on `.shot` packages
+**Implementation.** `spikes/ax-latency/` — Swift Package executable, reusable as a regression benchmark.
 
-**Question.** Does registering `.shot` as a UTI package allow Spotlight to index `manifest.json` + `ocr.json` contents? Does QuickLook render `thumb.jpg` + summary without a custom plugin?
+### Spike B — Spotlight + QuickLook on `.shot` packages · ⚠️ MIXED · `hq-alo`
 
-**DoD.** Minimal Xcode project registers the UTI, writes a synthetic `.shot` with fake `manifest.json`, `ocr.json`, `thumb.jpg`. Verify: (a) Spotlight returns the package when searching OCR text; (b) QuickLook previews `thumb.jpg`.
+**Question.** Does registering `.shot` as a UTI package allow Spotlight to index inner `manifest.json` + `ocr.json` contents? Does QuickLook render `thumb.jpg` without a custom plugin?
 
-**Feeds back into.** Whether the library index can lean on Spotlight (unlikely in v0.1 — keep SQLite+FTS5 as the load-bearing index) and whether a QuickLook plugin is needed (probably not for v0.1).
+**Result.**
+
+- **UTI registration — clean.** Finder shows `.shot` as "Shotfuse Capture Package" out of the box via `lsregister` + `UTExportedTypeDeclarations`. Conformance tree (`public.item` → `public.composite-content` → `dev.friquelme.shotfuse.shot`) verified via `mdls -name kMDItemContentTypeTree`.
+- **Spotlight — no.** `mdimport -t -d1` reports `Imported ... with no plugIn. 26 attributes returned`. `mdfind` on a unique OCR marker embedded in `ocr.json` returns empty (whole-volume and scoped). Package opacity — the property that makes Finder treat `.shot` as one bundle — fundamentally conflicts with Spotlight descending into inner files. These goals cannot coexist on the same UTI.
+- **QuickLook — no.** Finder spacebar on `.shot` shows the generic "?" document icon with the "SHOT" extension label. No `thumb.jpg` rendering, despite `com.apple.package` conformance matching a built-in `Package.qlgenerator`. A custom `QLPreviewProvider` (`QuickLookThumbnailing` framework) is required.
+
+**Decision.** Invariant 9 stands — SQLite+FTS5 remains the load-bearing index. Core Spotlight (`CSSearchableItem`, populated by Shotfuse's library scanner separately from the UTI) is deferred to post-v0.1 (§11). Custom QuickLook preview plugin is deferred to post-v0.1 (§11). Neither is a Weekend 1 blocker.
+
+**Implementation.** `spikes/uti-spotlight/` — Swift Package with a UTI-declaring stub bundle and a sample `.shot` generator. Reusable for future QuickLook plugin / Core Spotlight work.
 
 ---
 
@@ -273,6 +281,9 @@ Both spikes are architectural load-bearing. If either returns negative, this spe
 | Keymap reload | Restart-only for v0.1. Hot-reload deferred (§11). |
 | Bundle ID | `dev.friquelme.shotfuse`. |
 | License | MIT. |
+| AX enrichment sync vs async at `capturing → finalizing` | Sync. Spike A (2026-04-21, `hq-91t`): median-run aggregate p95 = 0.47ms across 4 apps × 20 iters. Benchmark code: `spikes/ax-latency/`. |
+| Spotlight integration for `.shot` | Not available via package UTI (Spike B, `hq-alo`). Core Spotlight `CSSearchableItem` deferred (§11). |
+| QuickLook preview for `.shot` | No built-in generator handles the composite-content subtype in practice. Custom `QLPreviewProvider` deferred (§11). |
 
 ---
 
@@ -292,6 +303,8 @@ Both spikes are architectural load-bearing. If either returns negative, this spe
 | First-run onboarding flow spec | Before Weekend 1 first user run (self included) |
 | Menubar icon state-machine spec | Before Weekend 1 first user run |
 | Localization / `Localizable.strings` infrastructure | When non-English contributors appear |
+| QuickLook preview plugin for `.shot` (`QLPreviewProvider` subclass via `QuickLookThumbnailing` framework) | After v0.1 daily use; if the generic "?" Finder icon is friction enough to warrant the ~100 LOC implementation. Spike B scaffold reusable. |
+| Core Spotlight library integration (`CSSearchableItem`, populated by the library scanner) | When users want `Cmd+Space` to surface captures without opening Shotfuse's own search overlay. Runs alongside — not through — the `.shot` package UTI. |
 
 ---
 
