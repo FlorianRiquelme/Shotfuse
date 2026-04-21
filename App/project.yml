@@ -1,0 +1,50 @@
+name: App
+options:
+  bundleIdPrefix: dev.friquelme
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+packages:
+  Core:
+    path: ../Core
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+
+targets:
+  App:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDevelopmentRegion: en
+        CFBundleDisplayName: Shotfuse
+        CFBundleName: $(PRODUCT_NAME)
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        LSUIElement: true
+        NSHumanReadableCopyright: "MIT License. See LICENSE."
+        NSScreenCaptureUsageDescription: "Shotfuse needs Screen Recording to capture regions, windows, and fullscreen."
+        NSAccessibilityUsageDescription: "Shotfuse reads the Accessibility tree to record the focused app and URL alongside each capture."
+    settings:
+      base:
+        PRODUCT_NAME: Shotfuse
+        PRODUCT_BUNDLE_IDENTIFIER: dev.friquelme.shotfuse
+        INFOPLIST_FILE: Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+    dependencies:
+      - package: Core
