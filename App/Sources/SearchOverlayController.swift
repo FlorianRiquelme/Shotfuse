@@ -21,7 +21,9 @@ public final class SearchOverlayController: NSObject, NSWindowDelegate {
 
     /// App-assigned hotkey id for the search overlay. The registry uses this
     /// to route Carbon events back to the owning controller.
-    public static let hotkeyID: UInt32 = 1
+    /// Must match `HotkeyBindings.searchHotkeyID` so region capture (id 1)
+    /// and search (id 3) don't clobber each other's Carbon registration.
+    public static let hotkeyID: UInt32 = HotkeyBindings.searchHotkeyID
 
     // MARK: - Public state
 

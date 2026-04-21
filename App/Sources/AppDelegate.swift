@@ -71,8 +71,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         self.libraryIndex = index
 
-        // SearchOverlayController owns its own Cmd+Shift+G registration.
-        let search = SearchOverlayController(index: index)
+        // SearchOverlayController owns its own Cmd+Shift+G registration, but
+        // shares the App's `CarbonHotkeyRegistry`. Two registry instances on
+        // the same Carbon event target cause only one handler's dispatch to
+        // fire — see `HotkeyRegistry.swift` "Singleton-like" caveat.
+        let search = SearchOverlayController(index: index, registry: hotkeyRegistry)
         self.searchController = search
         search.activate()
         if search.lastHotkeyError != nil {
