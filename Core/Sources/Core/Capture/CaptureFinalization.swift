@@ -409,19 +409,23 @@ public struct CaptureFinalization {
     ///   - writer: `ShotPackageWriter` — passed `inout` because the writer
     ///     flips a `didFsyncManifest` test-hook flag.
     ///   - now: Clock injection for deterministic tests.
+    /// - Returns: The `OCRPayload` produced from `frame.image` so callers
+    ///   (e.g. `CaptureCoordinator`) can feed the concatenated OCR text into
+    ///   `LibraryIndex.captures_fts.ocr_text` without re-reading `ocr.json`.
     /// - Throws:
     ///   - `CaptureFinalizationError.suppressedBySensitiveBundle` if
     ///     `context.frontmostBundleID ∈ SENSITIVE_BUNDLES`; nothing is written.
     ///   - `CaptureFinalizationError.imageEncodingFailed` / `.serializationFailed`
     ///     on encoding failure.
     ///   - `ShotPackageWriterError` on I/O failure.
+    @discardableResult
     public static func finalize(
         frame: CapturedFrame,
         context: Context,
         to finalURL: URL,
         writer: inout ShotPackageWriter,
         now: Date = Date()
-    ) throws {
+    ) throws -> OCRPayload {
         // ─────────────────────────────────────────────────────────────────
         // (1) SENSITIVE_BUNDLES gate — BEFORE any disk activity (SPEC §13.3).
         //     No .shot.tmp/ or .shot/ appears on disk when suppressed.
@@ -510,6 +514,22 @@ public struct CaptureFinalization {
         )
 
         // ─────────────────────────────────────────────────────────────────
+        // (5b) Run Vision OCR on the master image and encode ocr.json.
+        //      Best-effort: OCRRecognizer swallows Vision errors and returns
+        //      an empty `results` list; ocr.json is always written so readers
+        //      (CLI, FTS) can rely on its presence (SPEC §2 DoD / §6.3).
+        // ─────────────────────────────────────────────────────────────────
+        let ocrPayload = OCRRecognizer.recognize(image: frame.image)
+        let ocrData: Data
+        do {
+            let ocrEncoder = JSONEncoder()
+            ocrEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            ocrData = try ocrEncoder.encode(ocrPayload)
+        } catch {
+            throw CaptureFinalizationError.serializationFailed("ocr: \(error.localizedDescription)")
+        }
+
+        // ─────────────────────────────────────────────────────────────────
         // (6) Hand off to ShotPackageWriter for the atomic write.
         // ─────────────────────────────────────────────────────────────────
         try writer.write(
@@ -519,8 +539,11 @@ public struct CaptureFinalization {
                 "master.png":   masterPNG,
                 "thumb.jpg":    thumbJPEG,
                 "context.json": contextData,
+                "ocr.json":     ocrData,
             ]
         )
+
+        return ocrPayload
     }
 
     /// Applies SPEC §6.2 / §13.3 clipboard gating. Returns
