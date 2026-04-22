@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Pre-commit guard for XcodeGen drift.
+#
+# The repo gitignores *.xcodeproj/, so pbxproj files are not tracked.
+# Instead, local xcodeproj files must stay in sync with project.yml +
+# Sources/** on disk, otherwise `Shotfuse.xcworkspace` builds break
+# (see bd hq-abq — Commands/*.swift not found when pbxproj is stale).
+#
+# This hook detects staged changes under CLI/ or App/ that affect the
+# xcodeproj inputs (project.yml or Sources/**) and auto-runs xcodegen
+# to regenerate the local xcodeproj. It is fast (early-exits when no
+# relevant files are staged) and fails loudly if xcodegen is missing.
+
+set -euo pipefail
+
+# Collect staged file list once. `--diff-filter=ACMR` excludes deletions
+# (the pbxproj entry for a deleted file still needs regen, but xcodegen
+# already handles this — we just need to trigger on the change).
+staged_files="$(git diff --cached --name-only --diff-filter=ACMR || true)"
+
+if [ -z "$staged_files" ]; then
+  exit 0
+fi
+
+# Projects in this repo that use XcodeGen. Extend this list if more
+# modules gain a project.yml.
+projects=("CLI" "App")
+
+needs_regen=()
+for project in "${projects[@]}"; do
+  # Trigger regen when project.yml OR anything under Sources/** is staged.
+  if printf '%s\n' "$staged_files" \
+      | grep -Eq "^${project}/(project\.yml|Sources/)"; then
+    needs_regen+=("$project")
+  fi
+done
+
+if [ ${#needs_regen[@]} -eq 0 ]; then
+  exit 0
+fi
+
+if ! command -v xcodegen >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+pre-commit: xcodegen is required to regenerate xcodeproj files but was
+not found on PATH. Install it and retry:
+
+    brew install xcodegen
+
+After install, re-run your commit. (See CLAUDE.md > Build & Test.)
+EOF
+  exit 1
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+for project in "${needs_regen[@]}"; do
+  echo "pre-commit: regenerating ${project}/${project}.xcodeproj via xcodegen..."
+  if ! ( cd "${repo_root}/${project}" && xcodegen generate --quiet ); then
+    echo "pre-commit: xcodegen generate failed in ${project}/ — fix project.yml and retry." >&2
+    exit 1
+  fi
+done
+
+# xcodeproj files are gitignored, so nothing to re-stage. The local
+# workspace build will now pick up the refreshed pbxproj.
+exit 0

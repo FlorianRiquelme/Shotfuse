@@ -52,13 +52,39 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
+### Xcode projects (XcodeGen)
+
+`App/App.xcodeproj` and `CLI/CLI.xcodeproj` are generated from `App/project.yml`
+and `CLI/project.yml` via [XcodeGen](https://github.com/yonaskolb/XcodeGen). The
+generated `*.xcodeproj` directories are gitignored — each clone regenerates them
+locally.
+
+**When adding, renaming, or removing Swift files** under `App/Sources/` or
+`CLI/Sources/` (including nested dirs like `CLI/Sources/Commands/`), or when
+editing `project.yml`, the xcodeproj must be regenerated:
 
 ```bash
-# Example:
-# npm install
-# npm test
+brew install xcodegen   # one-time, if missing
+cd CLI && xcodegen generate   # and/or: cd App && xcodegen generate
 ```
+
+Skipping this step causes `Shotfuse.xcworkspace` builds to fail with
+"cannot find <Type> in scope" because the pbxproj does not list the new
+source files (see bd `hq-abq`).
+
+### Pre-commit guard
+
+`.githooks/pre-commit` auto-runs `xcodegen generate` whenever a commit stages
+changes to `project.yml` or `Sources/**` in either `CLI/` or `App/`. Activate
+it once per clone/worktree:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+If the hook reports `xcodegen is required ... not found on PATH`, install it
+with `brew install xcodegen` and retry the commit. Do not bypass the hook with
+`--no-verify` — the drift is silent and breaks CI/UAT builds.
 
 ## Architecture Overview
 
