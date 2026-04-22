@@ -40,12 +40,16 @@ public protocol ScreenCapturing: Sendable {
 /// that records the call without touching the filesystem (or, in
 /// integration tests, writes into a temp directory).
 public protocol Finalizing: Sendable {
+    /// Finalizes the package and returns the OCR text produced on
+    /// `frame.image`. Empty string means "OCR ran but found nothing".
+    /// Callers forward this into `LibraryIndex.captures_fts.ocr_text` so
+    /// the search overlay (SPEC §5 I7) can hit OCR tokens immediately.
     func finalize(
         frame: CapturedFrame,
         context: CaptureFinalization.Context,
         to finalURL: URL,
         now: Date
-    ) throws
+    ) throws -> String
 }
 
 /// Inserts rows into `LibraryIndex`. Production wraps the live actor;
@@ -119,15 +123,16 @@ public struct RealFinalizing: Finalizing {
         context: CaptureFinalization.Context,
         to finalURL: URL,
         now: Date
-    ) throws {
+    ) throws -> String {
         var writer = ShotPackageWriter()
-        try CaptureFinalization.finalize(
+        let ocr = try CaptureFinalization.finalize(
             frame: frame,
             context: context,
             to: finalURL,
             writer: &writer,
             now: now
         )
+        return ocr.concatenatedText
     }
 }
 
@@ -360,8 +365,9 @@ public actor CaptureCoordinator {
         }
 
         let finalizationContext = await contextProvider()
+        let ocrText: String
         do {
-            try finalizer.finalize(
+            ocrText = try finalizer.finalize(
                 frame: frame,
                 context: finalizationContext,
                 to: finalURL,
@@ -377,7 +383,8 @@ public actor CaptureCoordinator {
         let record = buildLibraryRecord(
             finalURL: finalURL,
             now: now,
-            context: finalizationContext
+            context: finalizationContext,
+            ocrText: ocrText
         )
         do {
             try await indexer.insert(record)
@@ -411,11 +418,18 @@ public actor CaptureCoordinator {
     private func buildLibraryRecord(
         finalURL: URL,
         now: Date,
-        context: CaptureFinalization.Context
+        context: CaptureFinalization.Context,
+        ocrText: String
     ) -> LibraryRecord {
         let id = finalURL.deletingPathExtension().lastPathComponent
         let createdAt = Int64(now.timeIntervalSince1970)
         let expiresAt = Int64(now.addingTimeInterval(CaptureFinalization.defaultFuseInterval).timeIntervalSince1970)
+        // `resolveClipboard` re-applies the SENSITIVE_BUNDLES gate so the FTS
+        // projection never sees a clipboard string that context.json omitted.
+        let (gatedClipboard, _) = CaptureFinalization.resolveClipboard(
+            context: context,
+            now: now
+        )
         return LibraryRecord(
             id: id,
             createdAt: createdAt,
@@ -425,7 +439,9 @@ public actor CaptureCoordinator {
             windowTitle: context.frontmostWindowTitle,
             fileURL: context.frontmostFileURL,
             gitRoot: context.frontmostGitRoot,
-            browserURL: context.frontmostBrowserURL
+            browserURL: context.frontmostBrowserURL,
+            clipboard: gatedClipboard,
+            ocrText: ocrText.isEmpty ? nil : ocrText
         )
     }
 

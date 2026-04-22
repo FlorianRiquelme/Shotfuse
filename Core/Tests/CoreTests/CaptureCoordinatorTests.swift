@@ -167,7 +167,7 @@ private actor RecordingFinalizer: Finalizing {
         context: CaptureFinalization.Context,
         to finalURL: URL,
         now: Date
-    ) throws {
+    ) throws -> String {
         // Record call synchronously via a blocking actor hop — tests are
         // single-consumer so this won't deadlock. We use a detached task
         // and wait for it to complete because `Finalizing.finalize` is
@@ -181,7 +181,7 @@ private actor RecordingFinalizer: Finalizing {
         sem.wait()
 
         switch behavior {
-        case .succeed: return
+        case .succeed: return ""
         case .throws_(let e): throw e
         }
     }

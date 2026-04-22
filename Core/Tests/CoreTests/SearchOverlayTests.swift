@@ -159,7 +159,7 @@ struct SearchOverlayTests {
 
     // MARK: - 3. Top-1 correctness across window_title, bundle_id, ocr_text
 
-    @Test("Top-1 hit: window_title, bundle_id-proxy (via fileURL), and ocr_text each find the expected row")
+    @Test("Top-1 hit: window_title, file_url, bundle_id, and ocr_text each find the expected row")
     func topOneCorrectness() async throws {
         let tmp = try Self.makeTmpDir()
         defer { Self.cleanup(tmp) }
@@ -167,9 +167,8 @@ struct SearchOverlayTests {
         let idx = try Self.makeIndex(at: tmp)
         defer { Task { await idx.close() } }
 
-        // Fixture: three rows, each with a unique marker in one field only.
-        // We deliberately mix the other fields so the marker must come from
-        // the named column.
+        // Fixture: four rows, each with a unique marker in exactly one FTS
+        // column (schema v2 adds `bundle_id`, so bundle-id lookup is native).
         let rowByTitle = Self.record(
             id: "row-title",
             createdAt: 1_700_001_000,
@@ -179,16 +178,21 @@ struct SearchOverlayTests {
             clipboard: nil,
             ocrText: "irrelevant ocr payload"
         )
-        // FTS5's `captures_fts` columns are (window_title, file_url, clipboard,
-        // ocr_text). There is no `bundle_id` FTS column — instead, bundle-id
-        // style discovery happens via `file_url` (the file path). We exercise
-        // the `file_url` column here as the proxy for "bundle-id-ish" lookup.
         let rowByFileURL = Self.record(
             id: "row-file",
             createdAt: 1_700_002_000,
             windowTitle: "SomeEditor",
             fileURL: "file:///tmp/uniqueBundleMarkerBaboon.swift",
             bundleID: "com.microsoft.VSCode",
+            clipboard: nil,
+            ocrText: "irrelevant ocr payload"
+        )
+        let rowByBundleID = Self.record(
+            id: "row-bundle",
+            createdAt: 1_700_002_500,
+            windowTitle: "YetAnotherEditor",
+            fileURL: "file:///tmp/b.swift",
+            bundleID: "dev.zed.UniqueBundleMarkerDingo",
             clipboard: nil,
             ocrText: "irrelevant ocr payload"
         )
@@ -203,16 +207,20 @@ struct SearchOverlayTests {
         )
         try await idx.insert(rowByTitle)
         try await idx.insert(rowByFileURL)
+        try await idx.insert(rowByBundleID)
         try await idx.insert(rowByOCR)
 
         // Window-title marker.
         let titleHits = try await idx.searchIDs(SearchQuery.sanitize("uniqueTitleMarkerAardvark"))
         #expect(titleHits.first == "row-title", "top-1 by window_title mismatch: \(titleHits)")
 
-        // File-URL marker (our stand-in for bundle-id-ish discovery per the
-        // FTS schema; bundle_id itself is a captures-table column, not FTS5).
+        // File-URL marker.
         let fileHits = try await idx.searchIDs(SearchQuery.sanitize("uniqueBundleMarkerBaboon"))
         #expect(fileHits.first == "row-file", "top-1 by file_url mismatch: \(fileHits)")
+
+        // bundle_id marker — schema v2.
+        let bundleHits = try await idx.searchIDs(SearchQuery.sanitize("UniqueBundleMarkerDingo"))
+        #expect(bundleHits.first == "row-bundle", "top-1 by bundle_id mismatch: \(bundleHits)")
 
         // OCR marker.
         let ocrHits = try await idx.searchIDs(SearchQuery.sanitize("uniqueOcrMarkerCapybara"))

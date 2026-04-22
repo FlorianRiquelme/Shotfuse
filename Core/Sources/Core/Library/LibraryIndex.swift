@@ -89,7 +89,7 @@ public struct LibraryRecord: Sendable, Equatable {
 /// );
 ///
 /// CREATE VIRTUAL TABLE captures_fts USING fts5(
-///   window_title, file_url, clipboard, ocr_text,
+///   window_title, file_url, clipboard, ocr_text, bundle_id,
 ///   content=''            -- external-content-less; we write rowids explicitly
 /// );
 ///
@@ -177,6 +177,16 @@ public actor LibraryIndex {
 
     // MARK: - Migrations
 
+    /// Current schema version. Bumped whenever the persistent layout changes
+    /// in a way existing DBs need to migrate through.
+    ///
+    /// v1 — original (window_title, file_url, clipboard, ocr_text).
+    /// v2 — add `bundle_id` as the 5th FTS5 column. FTS5 does not support
+    ///      `ALTER TABLE ... ADD COLUMN` on a virtual table, so the migration
+    ///      drops and recreates `captures_fts` then rebuilds the inverted
+    ///      index from the `captures` + `fts_rowid_map` tables.
+    private static let schemaVersion: Int = 2
+
     private static func migrate(_ db: OpaquePointer) throws {
         try exec(db, """
             CREATE TABLE IF NOT EXISTS captures (
@@ -202,10 +212,33 @@ public actor LibraryIndex {
               ON captures(expires_at);
             """)
 
-        // Contentless FTS5: we manage rowid mapping ourselves via
-        // `fts_rowid_map` rather than relying on `content=captures`,
-        // because the FTS columns are a superset (they include
-        // `clipboard` and `ocr_text` which are not in `captures`).
+        try exec(db, """
+            CREATE TABLE IF NOT EXISTS fts_rowid_map (
+                id     TEXT PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
+                rowid  INTEGER NOT NULL UNIQUE
+            );
+            """)
+
+        // Apply schema-version-aware FTS5 migration. The FTS5 virtual table
+        // does not tolerate ALTER TABLE, so we version the schema via
+        // `PRAGMA user_version` and rebuild the inverted index from the
+        // authoritative `captures` table when the column set changes.
+        let current = try readUserVersion(db)
+        if current < schemaVersion {
+            try migrateFTS(db, from: current, to: schemaVersion)
+            try exec(db, "PRAGMA user_version = \(schemaVersion);")
+        } else {
+            // First-ever boot (empty DB, user_version == 0 by default) OR
+            // forward-migrated already — ensure the v2 FTS table exists.
+            try ensureFTSv2(db)
+            if current == 0 {
+                try exec(db, "PRAGMA user_version = \(schemaVersion);")
+            }
+        }
+    }
+
+    /// Creates `captures_fts` (v2 column set) if it doesn't exist.
+    private static func ensureFTSv2(_ db: OpaquePointer) throws {
         try exec(db, """
             CREATE VIRTUAL TABLE IF NOT EXISTS captures_fts
               USING fts5(
@@ -213,16 +246,112 @@ public actor LibraryIndex {
                 file_url,
                 clipboard,
                 ocr_text,
+                bundle_id,
                 tokenize = 'unicode61 remove_diacritics 2'
               );
             """)
+    }
 
-        try exec(db, """
-            CREATE TABLE IF NOT EXISTS fts_rowid_map (
-                id     TEXT PRIMARY KEY REFERENCES captures(id) ON DELETE CASCADE,
-                rowid  INTEGER NOT NULL UNIQUE
-            );
-            """)
+    /// Rebuilds `captures_fts` in-place for a schema-version bump. Drops the
+    /// virtual table, recreates it at the target version, and re-ingests
+    /// every row in `captures` via the existing `fts_rowid_map` mapping so
+    /// previously-issued rowids remain stable. `clipboard` and `ocr_text`
+    /// columns are lost (we never persisted them outside FTS) — re-OCR / new
+    /// captures repopulate them on catch-up.
+    private static func migrateFTS(
+        _ db: OpaquePointer,
+        from: Int,
+        to: Int
+    ) throws {
+        // Drop the stale FTS table. Use IF EXISTS so fresh DBs stay happy.
+        try exec(db, "DROP TABLE IF EXISTS captures_fts;")
+        try ensureFTSv2(db)
+
+        // Re-insert one FTS row per captures row, preserving (rowid, id)
+        // pairs from fts_rowid_map. We walk captures + fts_rowid_map inside
+        // a single transaction so the virtual table's internal structures
+        // stay consistent.
+        try exec(db, "BEGIN IMMEDIATE;")
+        do {
+            // Purge any stale mappings whose captures row is gone.
+            try exec(db, """
+                DELETE FROM fts_rowid_map
+                  WHERE id NOT IN (SELECT id FROM captures);
+                """)
+
+            // Rebuild FTS from captures. rowid is chosen explicitly so the
+            // existing fts_rowid_map entries continue pointing at the right
+            // row. For captures without a mapping (should not happen in
+            // practice; defensive), we allocate a fresh rowid and insert a
+            // new mapping.
+            let selectSQL = """
+                SELECT c.id, c.bundle_id, c.window_title, c.file_url,
+                       m.rowid
+                  FROM captures c
+                  LEFT JOIN fts_rowid_map m ON m.id = c.id
+                  ORDER BY c.created_at ASC;
+                """
+
+            var rows: [(id: String, bundleID: String?, windowTitle: String?, fileURL: String?, rowid: Int64?)] = []
+            try prepareAndRun(db, selectSQL, bind: { _ in }) { stmt in
+                let id = columnText(stmt, 0) ?? ""
+                let bid = columnText(stmt, 1)
+                let wt  = columnText(stmt, 2)
+                let fu  = columnText(stmt, 3)
+                let rid: Int64? = (sqlite3_column_type(stmt, 4) == SQLITE_NULL)
+                    ? nil
+                    : sqlite3_column_int64(stmt, 4)
+                rows.append((id, bid, wt, fu, rid))
+            }
+
+            for row in rows {
+                if let rid = row.rowid {
+                    try prepareAndStep(db, """
+                        INSERT INTO captures_fts
+                          (rowid, window_title, file_url, clipboard, ocr_text, bundle_id)
+                          VALUES (?, ?, ?, NULL, NULL, ?);
+                        """) { stmt in
+                        sqlite3_bind_int64(stmt, 1, rid)
+                        bindOptionalText(stmt, 2, row.windowTitle)
+                        bindOptionalText(stmt, 3, row.fileURL)
+                        bindOptionalText(stmt, 4, row.bundleID)
+                    }
+                } else {
+                    // No mapping — allocate a fresh rowid. Should not occur
+                    // in healthy DBs; guards against future divergence.
+                    try prepareAndStep(db, """
+                        INSERT INTO captures_fts
+                          (window_title, file_url, clipboard, ocr_text, bundle_id)
+                          VALUES (?, ?, NULL, NULL, ?);
+                        """) { stmt in
+                        bindOptionalText(stmt, 1, row.windowTitle)
+                        bindOptionalText(stmt, 2, row.fileURL)
+                        bindOptionalText(stmt, 3, row.bundleID)
+                    }
+                    let newRowid = sqlite3_last_insert_rowid(db)
+                    try prepareAndStep(db, """
+                        INSERT INTO fts_rowid_map (id, rowid)
+                          VALUES (?, ?);
+                        """) { stmt in
+                        bindText(stmt, 1, row.id)
+                        sqlite3_bind_int64(stmt, 2, newRowid)
+                    }
+                }
+            }
+            try exec(db, "COMMIT;")
+        } catch {
+            try? exec(db, "ROLLBACK;")
+            throw error
+        }
+    }
+
+    /// Reads SQLite's `PRAGMA user_version` — the persistent schema counter.
+    private static func readUserVersion(_ db: OpaquePointer) throws -> Int {
+        var version: Int = 0
+        try prepareAndRun(db, "PRAGMA user_version;", bind: { _ in }) { stmt in
+            version = Int(sqlite3_column_int64(stmt, 0))
+        }
+        return version
     }
 
     // MARK: - Public API
@@ -262,14 +391,15 @@ public actor LibraryIndex {
             // 2. FTS row
             let ftsSQL = """
                 INSERT INTO captures_fts
-                  (window_title, file_url, clipboard, ocr_text)
-                VALUES (?, ?, ?, ?);
+                  (window_title, file_url, clipboard, ocr_text, bundle_id)
+                VALUES (?, ?, ?, ?, ?);
                 """
             try Self.prepareAndStep(db, ftsSQL) { stmt in
                 Self.bindOptionalText(stmt, 1, record.windowTitle)
                 Self.bindOptionalText(stmt, 2, record.fileURL)
                 Self.bindOptionalText(stmt, 3, record.clipboard)
                 Self.bindOptionalText(stmt, 4, record.ocrText)
+                Self.bindOptionalText(stmt, 5, record.bundleID)
             }
             let rowid = sqlite3_last_insert_rowid(db)
 

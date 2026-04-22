@@ -243,21 +243,91 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Gathers the runtime context (frontmost app, AX availability, etc.)
     /// for `CaptureFinalization`. In v0.1 the App shell is the only owner
     /// of `NSWorkspace` — Core is UI-free.
+    ///
+    /// Context fields are best-effort:
+    ///   * `frontmostBundleID` always populated from `NSWorkspace`.
+    ///   * `frontmostWindowTitle` only when `AXIsProcessTrusted()` — we never
+    ///     call AX APIs without TCC approval (avoids the permission prompt
+    ///     racing the capture hotkey).
+    ///   * `clipboard` captured best-effort from `NSPasteboard.general` and
+    ///     size-gated at `CaptureFinalization.clipboardMaxBytes` before the
+    ///     SENSITIVE_BUNDLES filter (SPEC §6.2 / §13.3) applies downstream.
     private func makeCaptureContext() -> CaptureFinalization.Context {
         let frontmost = NSWorkspace.shared.frontmostApplication
         let bundleID = frontmost?.bundleIdentifier ?? ""
         let axAvailable = AXIsProcessTrusted()
+
+        // Window title requires AX. Wrap in AXIsProcessTrusted so we don't
+        // trip the TCC prompt during a hotkey dispatch in dev builds.
+        let windowTitle: String? = axAvailable
+            ? Self.frontmostWindowTitle(for: frontmost)
+            : nil
+
+        // Clipboard: only capture plain text; truncate aggressively so the
+        // finalize path has a sane upper bound even before SPEC §6.2's
+        // grapheme-aware trim. 4KB covers virtually every useful clipboard
+        // snippet; the finalize stage enforces the 1KB SPEC limit.
+        let clipboardSnapshot = Self.readClipboardSnapshot(maxBytes: 4096)
+
         return CaptureFinalization.Context(
             frontmostBundleID: bundleID,
-            frontmostWindowTitle: nil,
+            frontmostWindowTitle: windowTitle,
             frontmostFileURL: nil,
             frontmostGitRoot: nil,
             frontmostBrowserURL: nil,
-            clipboard: nil,
-            clipboardLastModifiedAt: .distantPast,
+            clipboard: clipboardSnapshot,
+            clipboardLastModifiedAt: Date(),
             clipboardLastModifierBundleID: nil,
             axAvailable: axAvailable
         )
+    }
+
+    /// AX-only extraction of the frontmost window's title. Returns nil when
+    /// AX denies access, the app has no windows, or the title attribute is
+    /// empty. Pure read — never mutates the AX tree.
+    private static func frontmostWindowTitle(for app: NSRunningApplication?) -> String? {
+        guard let app else { return nil }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var focusedRef: CFTypeRef?
+        let rc = AXUIElementCopyAttributeValue(
+            axApp,
+            kAXFocusedWindowAttribute as CFString,
+            &focusedRef
+        )
+        guard rc == .success, let focused = focusedRef else { return nil }
+        // Swift can't guard-let-cast directly to AXUIElement on some SDKs;
+        // use a runtime-typed fall-through check.
+        let focusedAX = focused as! AXUIElement
+
+        var titleRef: CFTypeRef?
+        let trc = AXUIElementCopyAttributeValue(
+            focusedAX,
+            kAXTitleAttribute as CFString,
+            &titleRef
+        )
+        guard trc == .success, let t = titleRef as? String, !t.isEmpty else {
+            return nil
+        }
+        return t
+    }
+
+    /// Reads the general pasteboard's string representation, bounded at
+    /// `maxBytes` UTF-8 bytes. Returns nil for non-text pasteboards.
+    private static func readClipboardSnapshot(maxBytes: Int) -> String? {
+        let pb = NSPasteboard.general
+        guard let raw = pb.string(forType: .string), !raw.isEmpty else {
+            return nil
+        }
+        if raw.utf8.count <= maxBytes { return raw }
+        var accepted = ""
+        var bytes = 0
+        for cluster in raw {
+            let clusterBytes = String(cluster).utf8.count
+            if bytes + clusterBytes > maxBytes { break }
+            accepted.append(cluster)
+            bytes += clusterBytes
+        }
+        return accepted
     }
 
     /// Resolves the absolute path to the `shot` CLI. Looks adjacent to the
