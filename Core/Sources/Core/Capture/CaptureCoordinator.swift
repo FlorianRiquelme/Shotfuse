@@ -380,6 +380,14 @@ public actor CaptureCoordinator {
             throw error
         }
 
+        // SPEC §2 Weekend 1 DoD: the PNG of the capture MUST be on the
+        // clipboard by the time `fsync` of the .shot returns. `finalizer.finalize`
+        // has already fsynced `master.png`, so writing its bytes to the
+        // pasteboard here is the latest-safe moment in the pipeline. Failures
+        // are logged and swallowed — we never want a pasteboard hiccup to
+        // abort a successful capture that's already on disk.
+        ClipboardWriter.copyMaster(at: finalURL)
+
         let record = buildLibraryRecord(
             finalURL: finalURL,
             now: now,
