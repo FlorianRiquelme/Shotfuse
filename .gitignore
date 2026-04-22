@@ -3,6 +3,9 @@
 .dolt/
 *.db
 .beads-credential-key
+# Solo use: auto-exported issues live in the Dolt DB (source of truth);
+# JSONL is a viewer-only artifact (bv) and shouldn't be synced via git.
+.beads/issues.jsonl
 
 # macOS
 .DS_Store
