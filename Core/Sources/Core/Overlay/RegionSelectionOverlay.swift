@@ -17,6 +17,19 @@ public enum RegionSelectionError: Error, Sendable {
     case noDisplaysAvailable
 }
 
+/// Minimum drag extent (in points, both axes) required to commit a selection.
+/// A click-without-drag or a sub-threshold nudge is treated as an Esc cancel so
+/// the capture pipeline never receives a degenerate 1x1 region (hq-6f9).
+let minSelectionSize: CGFloat = 8
+
+/// Returns true when the span between two drag points is large enough (on both
+/// axes) to qualify as an intentional selection. Sub-threshold drags are
+/// rejected and routed through the cancel path. Pure function so it can be
+/// unit-tested without AppKit / real mouse events.
+func isSelectionAboveMinimum(from a: CGPoint, to b: CGPoint) -> Bool {
+    abs(a.x - b.x) >= minSelectionSize && abs(a.y - b.y) >= minSelectionSize
+}
+
 /// Borderless, transparent, per-display overlay window. Captures drag events
 /// and forwards them to the backing view. One instance per screen.
 @MainActor
@@ -84,6 +97,14 @@ final class OverlayView: NSView {
         dragStart = nil
         dragCurrent = nil
         needsDisplay = true
+        // Reject sub-threshold drags (including plain clicks) by routing through
+        // the cancel path, same as Esc. Keeps degenerate 1x1 selections out of
+        // the capture pipeline (hq-6f9).
+        guard isSelectionAboveMinimum(from: a, to: p) else {
+            NSLog("[shotfuse-overlay] mouseUp sub-threshold drag (\(abs(p.x - a.x))x\(abs(p.y - a.y)) < \(minSelectionSize)) — cancelling")
+            onCancel?()
+            return
+        }
         onRelease?(a, p)
         NSLog("[shotfuse-overlay] mouseUp at (\(p.x), \(p.y)) — start=(\(a.x),\(a.y))")
     }

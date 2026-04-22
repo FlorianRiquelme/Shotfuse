@@ -171,6 +171,34 @@ struct RegionOverlayTests {
         #endif
     }
 
+    // MARK: - (d) Minimum selection threshold (hq-6f9)
+
+    #if canImport(AppKit)
+    @Test("Sub-8px drag on either axis is rejected (click without drag → cancel)")
+    func subThresholdDragRejected() {
+        // Plain click (no motion).
+        #expect(isSelectionAboveMinimum(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 100, y: 100)) == false)
+        // 1x1 nudge — the exact degenerate case from the UAT.
+        #expect(isSelectionAboveMinimum(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 101, y: 101)) == false)
+        // 7x7 — just below threshold.
+        #expect(isSelectionAboveMinimum(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 107, y: 107)) == false)
+        // Wide but short: 100x7 — must still reject because BOTH axes must clear the threshold.
+        #expect(isSelectionAboveMinimum(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 200, y: 107)) == false)
+        // Short but tall: 7x100 — same logic on the other axis.
+        #expect(isSelectionAboveMinimum(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 107, y: 200)) == false)
+    }
+
+    @Test("≥8px drag on both axes is committed (normal selection)")
+    func aboveThresholdDragCommitted() {
+        // Exactly 8x8 — boundary value, must commit.
+        #expect(isSelectionAboveMinimum(from: CGPoint(x: 100, y: 100), to: CGPoint(x: 108, y: 108)) == true)
+        // Typical selection.
+        #expect(isSelectionAboveMinimum(from: CGPoint(x: 50, y: 50), to: CGPoint(x: 250, y: 250)) == true)
+        // Direction-independent: dragging up-left from end point still counts.
+        #expect(isSelectionAboveMinimum(from: CGPoint(x: 250, y: 250), to: CGPoint(x: 50, y: 50)) == true)
+    }
+    #endif
+
     // MARK: - Display metadata shape
 
     @Test("DisplayMetadata carries §6.1 fields: native dims, scale, localized name, global frame")
