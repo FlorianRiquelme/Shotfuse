@@ -34,6 +34,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private let log = Logger(subsystem: "dev.friquelme.shotfuse", category: "app")
     private var limbo: LimboHUDController?
     private let delegateRelay: DelegateRelay
+    private var libraryRoot: URL?
 
     // MARK: - Init
 
@@ -49,6 +50,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let shotfuseRoot = CLIPaths.rootDirectory()
         let libraryRoot = CLIPaths.libraryRoot()
         let indexDB = CLIPaths.indexDatabaseURL()
+        self.libraryRoot = libraryRoot
 
         do {
             try FileManager.default.createDirectory(
@@ -147,8 +149,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         case HotkeyBindings.regionHotkeyID:
             Task { [coordinator, weak self] in
                 do {
-                    let url = try await coordinator!.captureRegion()
-                    await self?.showLimbo(url: url)
+                    _ = try await coordinator!.captureRegion()
                 } catch {
                     self?.log.error("region capture failed: \(String(describing: error), privacy: .public)")
                 }
@@ -156,8 +157,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         case HotkeyBindings.fullscreenHotkeyID:
             Task { [coordinator, weak self] in
                 do {
-                    let url = try await coordinator!.captureFullscreen(display: CGMainDisplayID())
-                    await self?.showLimbo(url: url)
+                    _ = try await coordinator!.captureFullscreen(display: CGMainDisplayID())
                 } catch {
                     self?.log.error("fullscreen capture failed: \(String(describing: error), privacy: .public)")
                 }
@@ -176,6 +176,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Limbo HUD
+
+    /// True when `url` lives under the library root — i.e. this was a
+    /// region or fullscreen capture that produced a user-visible `.shot/`
+    /// package. Witness captures land under a separate witnesses root and
+    /// must not flash the HUD.
+    fileprivate func isLibraryCapture(url: URL) -> Bool {
+        guard let root = libraryRoot else { return false }
+        return url.resolvingSymlinksInPath().path
+            .hasPrefix(root.resolvingSymlinksInPath().path)
+    }
 
     fileprivate func showLimbo(url: URL) async {
         let manifestURL = url.appendingPathComponent("manifest.json")
@@ -365,8 +375,15 @@ private final class DelegateRelay: CaptureCoordinatorDelegate, @unchecked Sendab
     weak var owner: AppDelegate?
 
     func captureDidFinish(url: URL) async {
-        // AppDelegate.handleHotkey already invokes showLimbo directly
-        // after each capture. This hook is reserved for future telemetry.
+        // Single convergence point for HUD display — menu-bar, hotkey, and
+        // any future trigger path all land here (bug hq-xzs). Witness
+        // captures land outside libraryRoot and are filtered out so the
+        // HUD stays tied to user-initiated region/fullscreen shots.
+        guard let owner = self.owner else { return }
+        await MainActor.run {
+            guard owner.isLibraryCapture(url: url) else { return }
+            Task { await owner.showLimbo(url: url) }
+        }
     }
 
     func captureDidFail(error: Error) async {
