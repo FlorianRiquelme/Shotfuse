@@ -36,6 +36,20 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private let delegateRelay: DelegateRelay
     private var libraryRoot: URL?
 
+    // MARK: - Router (W2 / P4.2 — hq-8vb)
+
+    /// Router actor constructed at launch; nil only while
+    /// `applicationDidFinishLaunching` is still running.
+    private var router: Router?
+    /// Cached `(context, prediction)` for the most recent finalized
+    /// capture. Consumed by `handleLimbo(.redirect)` so the chooser can
+    /// open with the same scored candidates.
+    private var lastPrediction: (ctx: RouterContext, prediction: RouterPrediction)?
+    /// Active toast / chooser controllers; kept as properties so the
+    /// auto-dismiss Task or Cmd+Z closure can hide them safely.
+    private var routerToast: RouterToastController?
+    private var routerChooser: RouterChooserController?
+
     // MARK: - Init
 
     public override init() {
@@ -131,6 +145,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             log.info("shot binary not found; launch agent skipped")
         }
 
+        // Router (hq-8vb / W2). `~/.shotfuse/` already exists at this point
+        // (created by LibraryIndex or LaunchAgentInstaller) but we defensively
+        // create it again so the telemetry.jsonl append never races a missing
+        // directory.
+        do {
+            try FileManager.default.createDirectory(
+                at: shotfuseRoot,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            log.error("could not create shotfuse root for router telemetry: \(String(describing: error), privacy: .public)")
+        }
+        self.router = Router(
+            telemetryDirectory: shotfuseRoot,
+            fileSystem: DefaultFileSystemProbe(),
+            obsidianOpener: NSWorkspaceObsidianOpener()
+        )
+
         log.info("shotfuse launched root=\(shotfuseRoot.path, privacy: .public) library=\(libraryRoot.path, privacy: .public)")
     }
 
@@ -223,6 +255,41 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         limbo = controller
         controller.show()
 
+        // Router (hq-8vb / W2). The Limbo HUD is an *informational* 2-second
+        // surface; the Router drives the actual destination decision and
+        // surfaces its own toast / chooser in parallel. Sensitive-bundle
+        // captures abort in CaptureFinalization before showLimbo is ever
+        // called, so this path never routes secrets.
+        if let router = self.router {
+            let ctxPayload = Self.readCaptureContext(shotURL: url)
+            let routerCtx = RouterContext(
+                id: id,
+                bundleID: ctxPayload.bundleID,
+                windowTitle: ctxPayload.windowTitle,
+                gitRoot: ctxPayload.gitRoot.map { URL(fileURLWithPath: $0) },
+                frontmostHasObsidianURL: Self.frontmostHasObsidianURL(),
+                homeDirectory: FileManager.default.homeDirectoryForCurrentUser
+            )
+            let prediction = await router.predict(routerCtx)
+            self.lastPrediction = (routerCtx, prediction)
+
+            if prediction.shouldAutoDeliver {
+                // Auto-deliver on the router actor, then surface the toast.
+                _ = try? await router.decide(
+                    context: routerCtx,
+                    prediction: prediction,
+                    hostDecision: .auto
+                )
+                self.presentRouterToast(prediction: prediction, context: routerCtx)
+            } else {
+                self.presentRouterChooser(
+                    prediction: prediction,
+                    context: routerCtx,
+                    via: { .userChoseFromChooser($0) }
+                )
+            }
+        }
+
         try? await Task.sleep(nanoseconds: 2_000_000_000)
         controller.hide()
     }
@@ -244,8 +311,64 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 try? FileManager.default.removeItem(at: url)
             }
         case .redirect:
-            break  // Router is W2
+            // Router (hq-8vb / W2). Cmd+Z inside the Limbo HUD re-opens
+            // the chooser with the same scored candidates so the user can
+            // override an auto-deliver decision.
+            guard let (ctx, pred) = self.lastPrediction else {
+                log.debug("limbo redirect ignored: no cached router prediction")
+                return
+            }
+            presentRouterChooser(
+                prediction: pred,
+                context: ctx,
+                via: { .userRedirectedViaCmdZ($0) }
+            )
         }
+    }
+
+    // MARK: - Router helpers
+
+    /// Shows the router toast and wires Cmd+Z to re-open the chooser.
+    private func presentRouterToast(prediction: RouterPrediction, context: RouterContext) {
+        routerToast?.hide()
+        let toast = RouterToastController(
+            destination: prediction.top.dest
+        ) { [weak self] in
+            guard let self else { return }
+            self.presentRouterChooser(
+                prediction: prediction,
+                context: context,
+                via: { .userRedirectedViaCmdZ($0) }
+            )
+        }
+        self.routerToast = toast
+        toast.show()
+    }
+
+    /// Shows the 3-option chooser and wires the user's pick back through
+    /// `Router.decide`. `via` maps a chosen destination into the
+    /// appropriate `RouterHostDecision` variant so the same helper works
+    /// for both the no-auto path (`.userChoseFromChooser`) and the
+    /// redirected-after-toast path (`.userRedirectedViaCmdZ`).
+    private func presentRouterChooser(
+        prediction: RouterPrediction,
+        context: RouterContext,
+        via: @escaping @Sendable (RouterDestination) -> RouterHostDecision
+    ) {
+        routerChooser?.hide()
+        let chooser = RouterChooserController(prediction: prediction) { [weak self] dest in
+            guard let self, let router = self.router else { return }
+            let decision = via(dest)
+            Task {
+                _ = try? await router.decide(
+                    context: context,
+                    prediction: prediction,
+                    hostDecision: decision
+                )
+            }
+        }
+        self.routerChooser = chooser
+        chooser.show()
     }
 
     // MARK: - Capture context
@@ -319,6 +442,40 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
         return t
+    }
+
+    // MARK: - Router context extraction
+
+    /// Shot-package context fields the router cares about. Sourced from
+    /// `context.json` (§6.2) so we don't need to touch the manifest
+    /// schema. All fields are optional so a malformed or absent file
+    /// degrades gracefully to Clipboard fallback.
+    fileprivate struct RouterContextSnapshot {
+        let bundleID: String?
+        let windowTitle: String?
+        let gitRoot: String?
+    }
+
+    fileprivate static func readCaptureContext(shotURL: URL) -> RouterContextSnapshot {
+        let contextURL = shotURL.appendingPathComponent("context.json")
+        guard let data = try? Data(contentsOf: contextURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let frontmost = json["frontmost"] as? [String: Any] else {
+            return RouterContextSnapshot(bundleID: nil, windowTitle: nil, gitRoot: nil)
+        }
+        return RouterContextSnapshot(
+            bundleID: frontmost["bundle_id"] as? String,
+            windowTitle: frontmost["window_title"] as? String,
+            gitRoot: frontmost["git_root"] as? String
+        )
+    }
+
+    /// `true` iff LaunchServices can resolve an application for the
+    /// `obsidian://` URL scheme — used as a cheap "is Obsidian
+    /// installed" probe to feed `RouterContext.frontmostHasObsidianURL`.
+    fileprivate static func frontmostHasObsidianURL() -> Bool {
+        guard let url = URL(string: "obsidian://") else { return false }
+        return NSWorkspace.shared.urlForApplication(toOpen: url) != nil
     }
 
     /// Reads the general pasteboard's string representation, bounded at
