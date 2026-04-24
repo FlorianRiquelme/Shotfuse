@@ -59,6 +59,14 @@ final class OverlayView: NSView {
     // Accept the very first click that activates the overlay window.
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    // Show a crosshair cursor while the overlay is live (hq-agj). AppKit
+    // reapplies cursor rects automatically on bounds/window changes; we just
+    // declare that the entire view should show `.crosshair`.
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .crosshair)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         NSColor.black.withAlphaComponent(0.2).setFill()
         bounds.fill()
