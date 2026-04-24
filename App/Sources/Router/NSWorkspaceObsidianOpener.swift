@@ -29,8 +29,8 @@ public struct NSWorkspaceObsidianOpener: ObsidianOpener {
 
         public var errorDescription: String? {
             switch self {
-            case .failedToOpen(let url):
-                return "Failed to open URL: \(url.absoluteString)"
+            case .failedToOpen:
+                return "Failed to open Obsidian URL."
             }
         }
     }

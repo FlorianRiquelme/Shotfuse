@@ -98,6 +98,10 @@ final class DiskBackedFileSystemProbe: FileSystemProbe, @unchecked Sendable {
         try FileManager.default.moveItem(at: srcURL, to: dstURL)
     }
 
+    func copyItem(at srcURL: URL, to dstURL: URL) throws {
+        try FileManager.default.copyItem(at: srcURL, to: dstURL)
+    }
+
     func fileSize(at url: URL) throws -> UInt64 {
         let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
         return attrs[.size] as? UInt64 ?? 0
@@ -138,6 +142,13 @@ private func makeTempDirectory() -> URL {
     return tempDir
 }
 
+private func makeShotPackage(in root: URL, id: String = UUID().uuidString, masterData: Data = Data("png-bytes".utf8)) throws -> URL {
+    let packageURL = root.appendingPathComponent(id).appendingPathExtension("shot")
+    try FileManager.default.createDirectory(at: packageURL, withIntermediateDirectories: true)
+    try masterData.write(to: packageURL.appendingPathComponent("master.png"))
+    return packageURL
+}
+
 private func readLastTelemetry(telemetryURL: URL) throws -> [String: Any]? {
     let data = try Data(contentsOf: telemetryURL)
     guard let text = String(data: data, encoding: .utf8) else { return nil }
@@ -165,9 +176,11 @@ struct RouterTests {
 
         let gitRoot = tempTestDirectory.appendingPathComponent("test-repo")
         try probe.createDirectory(at: gitRoot, withIntermediateDirectories: true, attributes: nil)
+        let captureID = UUID().uuidString
+        let packageURL = try makeShotPackage(in: tempTestDirectory, id: captureID, masterData: Data("project-png".utf8))
 
         let context = RouterContext(
-            id: UUID().uuidString,
+            id: captureID,
             bundleID: "com.apple.dt.Xcode",
             windowTitle: "MyProject - ViewController.swift",
             gitRoot: gitRoot,
@@ -182,12 +195,15 @@ struct RouterTests {
         #expect(prediction.shouldAutoDeliver == true)
         #expect(prediction.all.count == 3)
 
-        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto)
+        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto, packageURL: packageURL)
         #expect(outcome.chosen == .projectScreenshots(gitRootName: "test-repo"))
         #expect(outcome.sideEffectResult == .handled(.projectScreenshots(gitRootName: "test-repo")))
 
         let expectedProjectScreenshotsDir = gitRoot.appendingPathComponent("screenshots")
+        let expectedProjectScreenshot = expectedProjectScreenshotsDir.appendingPathComponent("\(captureID).png")
         #expect(probe.fileExists(atPath: expectedProjectScreenshotsDir.path))
+        #expect(probe.fileExists(atPath: expectedProjectScreenshot.path))
+        #expect(try Data(contentsOf: expectedProjectScreenshot) == Data("project-png".utf8))
 
         let telemetryURL = tempTestDirectory.appendingPathComponent(".shotfuse").appendingPathComponent("telemetry.jsonl")
         let json = try readLastTelemetry(telemetryURL: telemetryURL)
@@ -208,8 +224,12 @@ struct RouterTests {
             obsidianOpener: mockOpener
         )
 
+        let captureID = UUID().uuidString
+        let packageURL = try makeShotPackage(in: tempTestDirectory, id: captureID)
+        let masterURL = packageURL.appendingPathComponent("master.png")
+
         let context = RouterContext(
-            id: UUID().uuidString,
+            id: captureID,
             bundleID: "md.obsidian",
             windowTitle: "Daily Note",
             gitRoot: nil,
@@ -223,12 +243,21 @@ struct RouterTests {
         #expect(prediction.top.score == 0.90)
         #expect(prediction.shouldAutoDeliver == true)
 
-        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto)
+        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto, packageURL: packageURL)
         #expect(outcome.chosen == .obsidianDaily)
         #expect(outcome.sideEffectResult == .handled(.obsidianDaily))
 
         let openedURLs = await mockOpener.openedURLs
-        #expect(openedURLs.contains(URL(string: "obsidian://daily")!))
+        #expect(openedURLs.count == 1)
+        let opened = try #require(openedURLs.first)
+        let components = try #require(URLComponents(url: opened, resolvingAgainstBaseURL: false))
+        #expect(components.scheme == "obsidian")
+        #expect(components.host == "daily")
+        let items = Dictionary(uniqueKeysWithValues: (components.queryItems ?? []).compactMap { item in
+            item.value.map { (item.name, $0) }
+        })
+        #expect(items["append"] == "true")
+        #expect(items["content"]?.contains(masterURL.absoluteString) == true)
 
         let telemetryURL = tempTestDirectory.appendingPathComponent(".shotfuse").appendingPathComponent("telemetry.jsonl")
         let json = try readLastTelemetry(telemetryURL: telemetryURL)
@@ -256,6 +285,7 @@ struct RouterTests {
             fileSystem: probe,
             obsidianOpener: mockOpener
         )
+        let packageURL = try makeShotPackage(in: tempTestDirectory)
 
         let context = RouterContext(
             id: UUID().uuidString,
@@ -270,7 +300,7 @@ struct RouterTests {
         let prediction = await router.predict(context)
         #expect(prediction.top.dest == .projectScreenshots(gitRootName: "unwritable-repo"))
 
-        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto)
+        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto, packageURL: packageURL)
 
         #expect(outcome.chosen == .projectScreenshots(gitRootName: "unwritable-repo"))
         #expect(outcome.sideEffectResult == .fellBackToClipboard(reason: .notWritable))
@@ -467,6 +497,7 @@ struct RouterTests {
             fileSystem: probe,
             obsidianOpener: mockOpener
         )
+        let packageURL = try makeShotPackage(in: tempTestDirectory)
 
         let context = RouterContext(
             id: UUID().uuidString,
@@ -482,7 +513,7 @@ struct RouterTests {
         #expect(prediction.top.score == 0.90)
         #expect(prediction.shouldAutoDeliver == true)
 
-        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto)
+        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto, packageURL: packageURL)
         #expect(outcome.chosen == .obsidianDaily)
         #expect(outcome.sideEffectResult == .fellBackToClipboard(reason: .obsidianOpenFailed))
     }
@@ -506,6 +537,7 @@ struct RouterTests {
             fileSystem: probe,
             obsidianOpener: mockOpener
         )
+        let packageURL = try makeShotPackage(in: tempTestDirectory)
 
         let context = RouterContext(
             id: UUID().uuidString,
@@ -520,7 +552,7 @@ struct RouterTests {
         let prediction = await router.predict(context)
         #expect(prediction.top.dest == .projectScreenshots(gitRootName: "code-repo"))
 
-        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto)
+        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto, packageURL: packageURL)
         #expect(outcome.chosen == .projectScreenshots(gitRootName: "code-repo"))
         if case .fellBackToClipboard = outcome.sideEffectResult {
             // Expected.
@@ -543,9 +575,11 @@ struct RouterTests {
 
         let gitRoot = tempTestDirectory.appendingPathComponent("another-repo")
         try probe.createDirectory(at: gitRoot, withIntermediateDirectories: true, attributes: nil)
+        let captureID = UUID().uuidString
+        let packageURL = try makeShotPackage(in: tempTestDirectory, id: captureID)
 
         let context = RouterContext(
-            id: UUID().uuidString,
+            id: captureID,
             bundleID: "com.random.app",
             windowTitle: "Generic Window",
             gitRoot: gitRoot,
@@ -557,17 +591,85 @@ struct RouterTests {
         #expect(prediction.shouldAutoDeliver == false)
 
         let chosenDest: RouterDestination = .projectScreenshots(gitRootName: "another-repo")
-        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .userChoseFromChooser(chosenDest))
+        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .userChoseFromChooser(chosenDest), packageURL: packageURL)
 
         #expect(outcome.chosen == chosenDest)
         #expect(outcome.sideEffectResult == .handled(chosenDest))
 
         let expectedProjectScreenshotsDir = gitRoot.appendingPathComponent("screenshots")
+        let expectedProjectScreenshot = expectedProjectScreenshotsDir.appendingPathComponent("\(captureID).png")
         #expect(probe.fileExists(atPath: expectedProjectScreenshotsDir.path))
+        #expect(probe.fileExists(atPath: expectedProjectScreenshot.path))
 
         let telemetryURL = tempTestDirectory.appendingPathComponent(".shotfuse").appendingPathComponent("telemetry.jsonl")
         let json = try readLastTelemetry(telemetryURL: telemetryURL)
         #expect(json?["predicted"] as? String == "clipboard")
         #expect(json?["chosen"] as? String == "project_screenshots")
+    }
+
+    @Test("IDE without gitRoot does not offer invalid project destination")
+    func testNoProjectDestinationWhenGitRootMissing() async throws {
+        let tempTestDirectory = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempTestDirectory) }
+        let router = Router(
+            telemetryDirectory: tempTestDirectory.appendingPathComponent(".shotfuse"),
+            fileSystem: DiskBackedFileSystemProbe(),
+            obsidianOpener: MockObsidianOpener()
+        )
+
+        let context = RouterContext(
+            id: UUID().uuidString,
+            bundleID: "com.apple.dt.Xcode",
+            windowTitle: "Unsaved.swift",
+            gitRoot: nil,
+            frontmostHasObsidianURL: false,
+            homeDirectory: tempTestDirectory
+        )
+
+        let prediction = await router.predict(context)
+        #expect(!prediction.all.contains { entry in
+            if case .projectScreenshots = entry.dest { return true }
+            return false
+        })
+        #expect(prediction.top.dest == .clipboard)
+        #expect(prediction.all.map(\.dest) == [.clipboard, .obsidianDaily])
+    }
+
+    @Test("Fallback outcome has UI-visible clipboard wording")
+    func testFallbackOutcomeHumanName() {
+        let result = RouterSideEffectResult.fellBackToClipboard(reason: .notWritable)
+
+        #expect(result.deliveredDestination == .clipboard)
+        #expect(result.humanName.contains("Clipboard"))
+        #expect(result.humanName.contains("destination not writable"))
+    }
+
+    @Test("Missing package falls back visibly instead of pretending delivery succeeded")
+    func testMissingPackageFallbackOutcome() async throws {
+        let tempTestDirectory = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: tempTestDirectory) }
+        let probe = DiskBackedFileSystemProbe()
+        let router = Router(
+            telemetryDirectory: tempTestDirectory.appendingPathComponent(".shotfuse"),
+            fileSystem: probe,
+            obsidianOpener: MockObsidianOpener()
+        )
+
+        let gitRoot = tempTestDirectory.appendingPathComponent("missing-package-repo")
+        try probe.createDirectory(at: gitRoot, withIntermediateDirectories: true, attributes: nil)
+        let context = RouterContext(
+            id: UUID().uuidString,
+            bundleID: "com.apple.dt.Xcode",
+            windowTitle: "Missing Package",
+            gitRoot: gitRoot,
+            frontmostHasObsidianURL: false,
+            homeDirectory: tempTestDirectory
+        )
+        let prediction = await router.predict(context)
+
+        let outcome = try await router.decide(context: context, prediction: prediction, hostDecision: .auto)
+
+        #expect(outcome.sideEffectResult == .fellBackToClipboard(reason: .missingCapture))
+        #expect(outcome.sideEffectResult.humanName.contains("capture file missing"))
     }
 }

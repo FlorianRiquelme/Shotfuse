@@ -44,7 +44,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Cached `(context, prediction)` for the most recent finalized
     /// capture. Consumed by `handleLimbo(.redirect)` so the chooser can
     /// open with the same scored candidates.
-    private var lastPrediction: (ctx: RouterContext, prediction: RouterPrediction)?
+    private var lastPrediction: (ctx: RouterContext, prediction: RouterPrediction, packageURL: URL)?
     /// Active toast / chooser controllers; kept as properties so the
     /// auto-dismiss Task or Cmd+Z closure can hide them safely.
     private var routerToast: RouterToastController?
@@ -271,20 +271,27 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 homeDirectory: FileManager.default.homeDirectoryForCurrentUser
             )
             let prediction = await router.predict(routerCtx)
-            self.lastPrediction = (routerCtx, prediction)
+            self.lastPrediction = (routerCtx, prediction, url)
 
             if prediction.shouldAutoDeliver {
-                // Auto-deliver on the router actor, then surface the toast.
-                _ = try? await router.decide(
+                // Auto-deliver on the router actor, then surface the actual outcome.
+                let outcome = try? await router.decide(
                     context: routerCtx,
                     prediction: prediction,
-                    hostDecision: .auto
+                    hostDecision: .auto,
+                    packageURL: url
                 )
-                self.presentRouterToast(prediction: prediction, context: routerCtx)
+                self.presentRouterToast(
+                    result: outcome?.sideEffectResult ?? .fellBackToClipboard(reason: .unknownError),
+                    prediction: prediction,
+                    context: routerCtx,
+                    packageURL: url
+                )
             } else {
                 self.presentRouterChooser(
                     prediction: prediction,
                     context: routerCtx,
+                    packageURL: url,
                     via: { .userChoseFromChooser($0) }
                 )
             }
@@ -314,13 +321,16 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             // Router (hq-8vb / W2). Cmd+Z inside the Limbo HUD re-opens
             // the chooser with the same scored candidates so the user can
             // override an auto-deliver decision.
-            guard let (ctx, pred) = self.lastPrediction else {
-                log.debug("limbo redirect ignored: no cached router prediction")
+            guard let (ctx, pred, packageURL) = self.lastPrediction,
+                  ctx.id == id,
+                  packageURL == url else {
+                log.debug("limbo redirect ignored: no matching cached router prediction")
                 return
             }
             presentRouterChooser(
                 prediction: pred,
                 context: ctx,
+                packageURL: packageURL,
                 via: { .userRedirectedViaCmdZ($0) }
             )
         }
@@ -329,15 +339,21 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Router helpers
 
     /// Shows the router toast and wires Cmd+Z to re-open the chooser.
-    private func presentRouterToast(prediction: RouterPrediction, context: RouterContext) {
+    private func presentRouterToast(
+        result: RouterSideEffectResult,
+        prediction: RouterPrediction,
+        context: RouterContext,
+        packageURL: URL
+    ) {
         routerToast?.hide()
         let toast = RouterToastController(
-            destination: prediction.top.dest
+            result: result
         ) { [weak self] in
             guard let self else { return }
             self.presentRouterChooser(
                 prediction: prediction,
                 context: context,
+                packageURL: packageURL,
                 via: { .userRedirectedViaCmdZ($0) }
             )
         }
@@ -353,17 +369,25 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private func presentRouterChooser(
         prediction: RouterPrediction,
         context: RouterContext,
+        packageURL: URL,
         via: @escaping @Sendable (RouterDestination) -> RouterHostDecision
     ) {
         routerChooser?.hide()
         let chooser = RouterChooserController(prediction: prediction) { [weak self] dest in
             guard let self, let router = self.router else { return }
             let decision = via(dest)
-            Task {
-                _ = try? await router.decide(
+            Task { @MainActor in
+                let outcome = try? await router.decide(
                     context: context,
                     prediction: prediction,
-                    hostDecision: decision
+                    hostDecision: decision,
+                    packageURL: packageURL
+                )
+                self.presentRouterToast(
+                    result: outcome?.sideEffectResult ?? .fellBackToClipboard(reason: .unknownError),
+                    prediction: prediction,
+                    context: context,
+                    packageURL: packageURL
                 )
             }
         }
@@ -395,6 +419,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         let windowTitle: String? = axAvailable
             ? Self.frontmostWindowTitle(for: frontmost)
             : nil
+        let frontmostFileURL: URL? = axAvailable
+            ? Self.frontmostDocumentURL(for: frontmost)
+            : nil
+        let frontmostGitRoot = frontmostFileURL.flatMap { Self.gitRoot(containing: $0) }
 
         // Clipboard: only capture plain text; truncate aggressively so the
         // finalize path has a sane upper bound even before SPEC §6.2's
@@ -405,8 +433,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         return CaptureFinalization.Context(
             frontmostBundleID: bundleID,
             frontmostWindowTitle: windowTitle,
-            frontmostFileURL: nil,
-            frontmostGitRoot: nil,
+            frontmostFileURL: frontmostFileURL?.absoluteString,
+            frontmostGitRoot: frontmostGitRoot?.path,
             frontmostBrowserURL: nil,
             clipboard: clipboardSnapshot,
             clipboardLastModifiedAt: Date(),
@@ -442,6 +470,57 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
         return t
+    }
+
+    /// AX-only extraction of the frontmost window's document/file URL.
+    /// Xcode commonly exposes `AXDocument`; browsers tend to expose `AXURL`.
+    /// Returns nil for non-file URLs because Router project delivery requires
+    /// walking the local filesystem to find a `.git` ancestor.
+    private static func frontmostDocumentURL(for app: NSRunningApplication?) -> URL? {
+        guard let app else { return nil }
+        let axApp = AXUIElementCreateApplication(app.processIdentifier)
+        var focusedRef: CFTypeRef?
+        let rc = AXUIElementCopyAttributeValue(
+            axApp,
+            kAXFocusedWindowAttribute as CFString,
+            &focusedRef
+        )
+        guard rc == .success, let focused = focusedRef else { return nil }
+        let focusedAX = focused as! AXUIElement
+
+        for attribute in ["AXDocument" as CFString, "AXURL" as CFString] {
+            var valueRef: CFTypeRef?
+            let valueRC = AXUIElementCopyAttributeValue(focusedAX, attribute, &valueRef)
+            guard valueRC == .success, let value = valueRef else { continue }
+            guard let url = normalizeAXDocumentURL(value), url.isFileURL else { continue }
+            return url
+        }
+        return nil
+    }
+
+    private static func normalizeAXDocumentURL(_ value: CFTypeRef) -> URL? {
+        if let url = value as? URL { return url }
+        guard let raw = value as? String, !raw.isEmpty else { return nil }
+        if let url = URL(string: raw), url.scheme != nil { return url }
+        if raw.hasPrefix("/") { return URL(fileURLWithPath: raw) }
+        return nil
+    }
+
+    /// Walks upward from a file or directory URL until a `.git` directory/file
+    /// is found. Returns nil when the frontmost document is outside a git repo.
+    private static func gitRoot(containing fileURL: URL) -> URL? {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        let exists = fm.fileExists(atPath: fileURL.path, isDirectory: &isDirectory)
+        var current = (exists && isDirectory.boolValue) ? fileURL : fileURL.deletingLastPathComponent()
+        while true {
+            if fm.fileExists(atPath: current.appendingPathComponent(".git").path) {
+                return current
+            }
+            let parent = current.deletingLastPathComponent()
+            if parent.path == current.path { return nil }
+            current = parent
+        }
     }
 
     // MARK: - Router context extraction

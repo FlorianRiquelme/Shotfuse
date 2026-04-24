@@ -27,14 +27,19 @@ public struct RouterScoringModel: Sendable {
         let clipboardScore = 0.1
         scoredDestinations.append((dest: .clipboard, score: clipboardScore))
 
-        // 2. Score Project Screenshots
-        var projectScreenshotsScore = 0.0
-        var projectScreenshotsDest: RouterDestination = .projectScreenshots(gitRootName: "") // Default/inactive
-        if let bundleID = context.bundleID, ideBundleIDs.contains(bundleID), let gitRootBasename = context.gitRootBasename {
-            projectScreenshotsScore = 0.95
-            projectScreenshotsDest = .projectScreenshots(gitRootName: gitRootBasename)
+        // 2. Score Project Screenshots only when a real git root exists.
+        // Avoid adding an inactive `.projectScreenshots(gitRootName: "")` option;
+        // chooser surfaces must never offer a project destination the Router
+        // cannot actually deliver to.
+        if let gitRootBasename = context.gitRootBasename, !gitRootBasename.isEmpty {
+            let projectScreenshotsScore: Double
+            if let bundleID = context.bundleID, ideBundleIDs.contains(bundleID) {
+                projectScreenshotsScore = 0.95
+            } else {
+                projectScreenshotsScore = 0.0
+            }
+            scoredDestinations.append((dest: .projectScreenshots(gitRootName: gitRootBasename), score: projectScreenshotsScore))
         }
-        scoredDestinations.append((dest: projectScreenshotsDest, score: projectScreenshotsScore))
 
         // 3. Score Obsidian Daily
         var obsidianDailyScore = 0.0

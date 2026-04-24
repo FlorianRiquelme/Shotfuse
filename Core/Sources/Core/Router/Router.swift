@@ -30,6 +30,7 @@ public protocol FileSystemProbe: Sendable {
     func homeDirectoryForCurrentUser() -> URL
     func removeItem(at url: URL) throws
     func moveItem(at srcURL: URL, to dstURL: URL) throws
+    func copyItem(at srcURL: URL, to dstURL: URL) throws
     func fileSize(at url: URL) throws -> UInt64
     func fileHandle(forWritingTo url: URL) throws -> FileHandle
     func fileHandle(forUpdating url: URL) throws -> FileHandle
@@ -79,6 +80,10 @@ public struct DefaultFileSystemProbe: FileSystemProbe {
         try FileManager.default.moveItem(at: srcURL, to: dstURL)
     }
 
+    public func copyItem(at srcURL: URL, to dstURL: URL) throws {
+        try FileManager.default.copyItem(at: srcURL, to: dstURL)
+    }
+
     public func fileSize(at url: URL) throws -> UInt64 {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         return attributes[.size] as? UInt64 ?? 0
@@ -110,9 +115,38 @@ public enum RouterSideEffectResult: Sendable, Codable, Equatable {
     case fellBackToClipboard(reason: FallbackReason)
 
     public enum FallbackReason: String, Sendable, Codable, Equatable {
+        case missingCapture = "missing_capture"
         case notWritable = "destination_not_writable"
         case obsidianOpenFailed = "obsidian_open_failed"
         case unknownError = "unknown_error"
+
+        /// End-user wording for UI surfaces. Keep this path-free and content-free.
+        public var humanName: String {
+            switch self {
+            case .missingCapture: return "capture file missing"
+            case .notWritable: return "destination not writable"
+            case .obsidianOpenFailed: return "Obsidian unavailable"
+            case .unknownError: return "delivery failed"
+            }
+        }
+    }
+
+    /// The destination that actually received the capture after fallback handling.
+    public var deliveredDestination: RouterDestination {
+        switch self {
+        case .handled(let destination): return destination
+        case .fellBackToClipboard: return .clipboard
+        }
+    }
+
+    /// End-user wording for toast / chooser feedback. It deliberately omits paths.
+    public var humanName: String {
+        switch self {
+        case .handled(let destination):
+            return destination.humanName
+        case .fellBackToClipboard(let reason):
+            return "Clipboard (fallback: \(reason.humanName))"
+        }
     }
 }
 
@@ -227,7 +261,7 @@ public actor Router {
     /// - Returns: A `RouterOutcome` detailing the chosen destination and side effect result.
     /// - Throws: An error if side effects fail critically.
     /// - SeeAlso: §7.1 decision rule
-    public func decide(context: RouterContext, prediction: RouterPrediction, hostDecision: RouterHostDecision) async throws -> RouterOutcome {
+    public func decide(context: RouterContext, prediction: RouterPrediction, hostDecision: RouterHostDecision, packageURL: URL? = nil) async throws -> RouterOutcome {
         let chosenDestination: RouterDestination
 
         switch hostDecision {
@@ -237,7 +271,7 @@ public actor Router {
             chosenDestination = dest
         }
 
-        let sideEffectResult = try await sideEffect(for: chosenDestination, context: context)
+        let sideEffectResult = try await sideEffect(for: chosenDestination, context: context, packageURL: packageURL)
 
         // Log telemetry after side effect result is known
         let now = Date()
@@ -266,7 +300,7 @@ public actor Router {
     /// - Returns: A `RouterSideEffectResult` indicating success or fallback.
     /// - Throws: `Error` if critical file system operations fail for a non-fallback path.
     /// - SeeAlso: §7.3 side-effect policy
-    public func sideEffect(for destination: RouterDestination, context: RouterContext) async throws -> RouterSideEffectResult {
+    public func sideEffect(for destination: RouterDestination, context: RouterContext, packageURL: URL? = nil) async throws -> RouterSideEffectResult {
         switch destination {
         case .clipboard:
             // Clipboard handling is outside the Router's direct side-effect responsibility,
@@ -279,6 +313,15 @@ public actor Router {
             guard let gitRoot = context.gitRoot else {
                 logger.error("Side effect: Project screenshots chosen but gitRoot is nil. Falling back to Clipboard.")
                 return .fellBackToClipboard(reason: .unknownError)
+            }
+            guard let packageURL else {
+                logger.error("Side effect: Project screenshots chosen but capture package URL is nil. Falling back to Clipboard.")
+                return .fellBackToClipboard(reason: .missingCapture)
+            }
+            let masterURL = packageURL.appendingPathComponent("master.png")
+            guard fileSystem.fileExists(atPath: masterURL.path) else {
+                logger.error("Side effect: Project screenshots source master missing: \(masterURL.path.sha256Prefix). Falling back to Clipboard.")
+                return .fellBackToClipboard(reason: .missingCapture)
             }
             let targetDirectory = gitRoot.appendingPathComponent("screenshots", isDirectory: true)
 
@@ -293,28 +336,70 @@ public actor Router {
                     return .fellBackToClipboard(reason: .notWritable)
                 }
 
-                logger.info("Side effect: Destination project screenshots for \(gitRootName.sha256Prefix) at \(targetDirectory.path.sha256Prefix)")
+                let targetFile = uniqueExportURL(in: targetDirectory, id: context.id, fileExtension: "png")
+                try fileSystem.copyItem(at: masterURL, to: targetFile)
+                logger.info("Side effect: Copied capture to project screenshots for \(gitRootName.sha256Prefix) at \(targetDirectory.path.sha256Prefix)")
                 return .handled(.projectScreenshots(gitRootName: gitRootName))
 
             } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileWriteNoPermissionError {
-                logger.error("Side effect: Project screenshots directory permission denied: \(targetDirectory.path.sha256Prefix). Error: \(error.localizedDescription). Falling back to Clipboard.")
+                logger.error("Side effect: Project screenshots permission denied: \(targetDirectory.path.sha256Prefix). Error: \(error.localizedDescription). Falling back to Clipboard.")
                 return .fellBackToClipboard(reason: .notWritable)
             } catch {
-                logger.error("Side effect: Failed to create/check project screenshots directory \(targetDirectory.path.sha256Prefix). Error: \(error.localizedDescription). Falling back to Clipboard.")
+                logger.error("Side effect: Failed to deliver to project screenshots \(targetDirectory.path.sha256Prefix). Error: \(error.localizedDescription). Falling back to Clipboard.")
                 return .fellBackToClipboard(reason: .unknownError)
             }
 
         case .obsidianDaily:
-            let obsidianURL = URL(string: "obsidian://daily")!
+            guard let packageURL else {
+                logger.error("Side effect: Obsidian daily chosen but capture package URL is nil. Falling back to Clipboard.")
+                return .fellBackToClipboard(reason: .missingCapture)
+            }
+            let masterURL = packageURL.appendingPathComponent("master.png")
+            guard fileSystem.fileExists(atPath: masterURL.path) else {
+                logger.error("Side effect: Obsidian source master missing: \(masterURL.path.sha256Prefix). Falling back to Clipboard.")
+                return .fellBackToClipboard(reason: .missingCapture)
+            }
+            let obsidianURL = obsidianDailyAppendURL(masterURL: masterURL)
             do {
                 try await obsidianOpener.open(obsidianURL)
-                logger.info("Side effect: Attempted to open Obsidian daily note.")
+                logger.info("Side effect: Delivered capture link to Obsidian daily note.")
                 return .handled(.obsidianDaily)
             } catch {
-                logger.error("Side effect: Failed to open Obsidian URL \(obsidianURL.path.sha256Prefix). Error: \(error.localizedDescription). Falling back to Clipboard.")
+                let errorType = String(describing: type(of: error))
+                logger.error("Side effect: Failed to open Obsidian URL. Error type: \(errorType, privacy: .public). Falling back to Clipboard.")
                 return .fellBackToClipboard(reason: .obsidianOpenFailed)
             }
         }
+    }
+
+    /// Returns a non-existing `<id>.ext` URL in the destination directory.
+    /// If the id already exists (for example after a user redirects twice), a
+    /// numeric suffix keeps routing append-only and avoids destructive overwrite.
+    private func uniqueExportURL(in directory: URL, id: String, fileExtension: String) -> URL {
+        var candidate = directory.appendingPathComponent(id).appendingPathExtension(fileExtension)
+        var suffix = 1
+        while fileSystem.fileExists(atPath: candidate.path) {
+            candidate = directory
+                .appendingPathComponent("\(id)-\(suffix)")
+                .appendingPathExtension(fileExtension)
+            suffix += 1
+        }
+        return candidate
+    }
+
+    /// Builds the official Obsidian daily-note URI with appendable markdown
+    /// content. The appended content links to the immutable `master.png` inside
+    /// the `.shot/` package, which keeps Router from writing into arbitrary vaults
+    /// while still delivering the capture into the daily-note workflow.
+    private func obsidianDailyAppendURL(masterURL: URL) -> URL {
+        var components = URLComponents()
+        components.scheme = "obsidian"
+        components.host = "daily"
+        components.queryItems = [
+            URLQueryItem(name: "append", value: "true"),
+            URLQueryItem(name: "content", value: "\n![](\(masterURL.absoluteString))\n")
+        ]
+        return components.url ?? URL(string: "obsidian://daily")!
     }
 
     /// Appends a telemetry line to `telemetry.jsonl` and manages file rotation.

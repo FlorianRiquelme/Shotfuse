@@ -157,7 +157,8 @@ public final class RouterChooserController: NSObject {
             y -= 34
         }
 
-        let hint = NSTextField(labelWithString: "1/2/3 · ↑↓+↩ · Esc → Clipboard")
+        let digitHint = (1...prediction.all.count).map(String.init).joined(separator: "/")
+        let hint = NSTextField(labelWithString: "\(digitHint) · ↑↓+↩ · Esc → Clipboard")
         hint.font = NSFont.systemFont(ofSize: 10)
         hint.textColor = .secondaryLabelColor
         hint.alignment = .center

@@ -19,17 +19,17 @@ public final class RouterToastController: NSObject {
     public typealias RedirectHandler = @MainActor @Sendable () -> Void
 
     private let panel: NSPanel
-    private let destination: RouterDestination
+    private let result: RouterSideEffectResult
     private let onRedirect: RedirectHandler
     private let log = Logger(subsystem: "dev.friquelme.shotfuse", category: "router.toast")
     private var autoDismissTask: Task<Void, Never>?
 
-    /// Creates a toast bound to a single destination. The controller owns
+    /// Creates a toast bound to the actual delivery result. The controller owns
     /// its own auto-dismiss timer; press Cmd+Z in its key window to
     /// cancel the timer and invoke `onRedirect`.
-    public init(destination: RouterDestination, onRedirect: @escaping RedirectHandler) {
+    public init(result: RouterSideEffectResult, onRedirect: @escaping RedirectHandler) {
         self.panel = Self.buildPanel()
-        self.destination = destination
+        self.result = result
         self.onRedirect = onRedirect
         super.init()
         configurePanel()
@@ -102,7 +102,7 @@ public final class RouterToastController: NSObject {
         let container = RouterToastContentView(frame: NSRect(origin: .zero, size: contentSize))
         container.controller = self
 
-        let label = NSTextField(labelWithString: "→ \(destination.humanName)  (⌘Z to change)")
+        let label = NSTextField(labelWithString: "→ \(result.humanName)  (⌘Z to change)")
         label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         label.textColor = .labelColor
         label.alignment = .left
